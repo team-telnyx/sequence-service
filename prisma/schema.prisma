@@ -1,0 +1,258 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  apiKey    String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  mailboxes Mailbox[]
+  sequences Sequence[]
+  webhooks  WebhookConfig[]
+
+  @@map("tenants")
+}
+
+model Mailbox {
+  id             String        @id @default(cuid())
+  email          String
+  displayName    String?
+  status         MailboxStatus @default(ACTIVE)
+  dailySendLimit Int           @default(50)
+  sentToday      Int           @default(0)
+  weight         Int           @default(1)
+  
+  // Gmail specific fields
+  refreshToken   String?
+  accessToken    String?
+  tokenExpiresAt DateTime?
+  
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sequenceSteps SequenceStep[]
+  sentEmails    SentEmail[]
+  signals       Signal[]
+
+  @@unique([tenantId, email])
+  @@map("mailboxes")
+}
+
+model Sequence {
+  id          String          @id @default(cuid())
+  name        String
+  description String?
+  status      SequenceStatus  @default(ACTIVE)
+  
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  steps       SequenceStep[]
+  enrollments SequenceEnrollment[]
+
+  @@map("sequences")
+}
+
+model SequenceStep {
+  id       String @id @default(cuid())
+  stepNumber Int
+  subject  String
+  body     String
+  delayHours Int @default(24)
+  
+  sequenceId String
+  sequence   Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  enrollmentSteps SequenceEnrollmentStep[]
+
+  @@unique([sequenceId, stepNumber])
+  @@map("sequence_steps")
+}
+
+model SequenceEnrollment {
+  id         String             @id @default(cuid())
+  contactEmail String
+  contactName  String?
+  status     EnrollmentStatus   @default(ACTIVE)
+  currentStep Int               @default(1)
+  
+  sequenceId String
+  sequence   Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  steps SequenceEnrollmentStep[]
+
+  @@unique([sequenceId, contactEmail])
+  @@map("sequence_enrollments")
+}
+
+model SequenceEnrollmentStep {
+  id        String                     @id @default(cuid())
+  status    SequenceEnrollmentStepStatus @default(PENDING)
+  scheduledAt DateTime?
+  sentAt    DateTime?
+  
+  enrollmentId String
+  enrollment   SequenceEnrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  
+  stepId String
+  step   SequenceStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+  
+  mailboxId String?
+  mailbox   Mailbox? @relation(fields: [mailboxId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sentEmails SentEmail[]
+
+  @@unique([enrollmentId, stepId])
+  @@map("sequence_enrollment_steps")
+}
+
+model SentEmail {
+  id        String @id @default(cuid())
+  messageId String @unique
+  subject   String
+  body      String
+  toEmail   String
+  toName    String?
+  fromEmail String
+  fromName  String?
+  
+  mailboxId String
+  mailbox   Mailbox @relation(fields: [mailboxId], references: [id])
+  
+  enrollmentStepId String?
+  enrollmentStep   SequenceEnrollmentStep? @relation(fields: [enrollmentStepId], references: [id])
+
+  sentAt DateTime @default(now())
+  
+  signals Signal[]
+
+  @@map("sent_emails")
+}
+
+model Signal {
+  id       String     @id @default(cuid())
+  type     SignalType
+  data     Json?
+  
+  mailboxId String
+  mailbox   Mailbox @relation(fields: [mailboxId], references: [id])
+  
+  sentEmailId String?
+  sentEmail   SentEmail? @relation(fields: [sentEmailId], references: [id])
+
+  detectedAt DateTime @default(now())
+
+  @@map("signals")
+}
+
+model WebhookConfig {
+  id     String @id @default(cuid())
+  url    String
+  secret String
+  events String[] // Array of event types
+  active Boolean @default(true)
+  
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deliveries WebhookDelivery[]
+
+  @@map("webhook_configs")
+}
+
+model WebhookDelivery {
+  id          String                 @id @default(cuid())
+  payload     Json
+  status      WebhookDeliveryStatus  @default(PENDING)
+  attempts    Int                    @default(0)
+  lastAttempt DateTime?
+  nextAttempt DateTime?
+  response    String?
+  
+  configId String
+  config   WebhookConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("webhook_deliveries")
+}
+
+// Enums
+enum MailboxStatus {
+  ACTIVE
+  PAUSED
+  OUT_OF_OFFICE
+  BOUNCED
+  DISABLED
+}
+
+enum SequenceStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  BOUNCED
+  UNSUBSCRIBED
+}
+
+enum SequenceEnrollmentStepStatus {
+  PENDING
+  SCHEDULED
+  SENT
+  BOUNCED
+  REPLIED
+  CLICKED
+  OPENED
+  UNSUBSCRIBED
+}
+
+enum SignalType {
+  REPLY
+  CLICK
+  OPEN
+  BOUNCE
+  OUT_OF_OFFICE
+  UNSUBSCRIBE
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+  EXPIRED
+}

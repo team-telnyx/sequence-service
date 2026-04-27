@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scout.sequence-api</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>.venv/bin/python3</string>
+        <string>-m</string>
+        <string>uvicorn</string>
+        <string>src.api.main:app</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8001</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/sequence-service</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DATABASE_URL</key>
+        <string>postgresql+asyncpg://user@localhost:5432/sequence_service</string>
+        <key>REDIS_URL</key>
+        <string>redis://localhost:6379</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/scout-sequence-api.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/scout-sequence-api.err</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scout.arq-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>.venv/bin/python3</string>
+        <string>run_arq_worker.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/sequence-service</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DATABASE_URL</key>
+        <string>postgresql+asyncpg://user@localhost:5432/sequence_service</string>
+        <key>GMAIL_ENABLED</key>
+        <string>true</string>
+        <key>GMAIL_SERVICE_ACCOUNT_FILE</key>
+        <string>/path/to/credentials/service-account.json</string>
+        <key>GMAIL_DELEGATED_USER</key>
+        <string>quinn@telnyx.com</string>
+        <key>GMAIL_MAILBOXES</key>
+        <string>quinn.c@telnyx.com,quinn.d@telnyx.com</string>
+        <key>SEQUENCE_SEND_MODE</key>
+        <string>real</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/scout-arq-worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/scout-arq-worker.err</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

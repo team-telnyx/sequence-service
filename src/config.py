@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     # Tracking
     tracking_enabled: bool = True
     tracking_base_url: str = "http://localhost:8000"  # Override in production
+
+    # CAN-SPAM / unsubscribe compliance (Wave 0). The visible unsubscribe link +
+    # physical postal address are ALWAYS added to every email regardless of
+    # tracking_enabled (only the open pixel / click-wrap are gated by tracking).
+    physical_address: str = "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
+    unsubscribe_mailto: str = "mailto:unsubscribe@telnyx.com?subject=unsubscribe"
+    # One-click (RFC 8058) unsubscribe requires a PUBLICLY REACHABLE tracking_base_url
+    # serving /track/unsubscribe. Until that host exists, keep this False so we do
+    # NOT advertise a dead one-click endpoint (track.telnyx.com is NXDOMAIN); the
+    # mailto unsubscribe is used instead.
+    one_click_unsubscribe_enabled: bool = False
     
     # API
     api_host: str = "0.0.0.0"

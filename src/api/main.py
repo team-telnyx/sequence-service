@@ -5,11 +5,30 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import logging
+import socket
+from urllib.parse import urlparse
+
 from src.config import get_settings
 from src.models.base import get_db, engine, Base, async_session
 from src.api import enrollments, sequences, mailboxes, webhooks, tracking, suppressions
 
 settings = get_settings()
+logger = logging.getLogger("sequence_service")
+
+
+def _tracking_host_reachable() -> bool:
+    """DNS-resolve the tracking_base_url host (Wave 0 health probe) so a dead
+    unsubscribe/tracking host (e.g. track.telnyx.com NXDOMAIN) can never silently
+    ship on every email again."""
+    try:
+        host = urlparse(settings.tracking_base_url).hostname
+        if not host:
+            return False
+        socket.getaddrinfo(host, None)
+        return True
+    except Exception:
+        return False
 
 
 @asynccontextmanager
@@ -18,6 +37,26 @@ async def lifespan(app: FastAPI):
     # Startup: create tables if they don't exist (dev only)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Wave 0 health probe: if open/click tracking OR one-click unsubscribe is on,
+    # the tracking host MUST resolve — else every email ships a dead link/endpoint.
+    # Fail LOUDLY rather than silently shipping a dead host (the original bug).
+    if settings.tracking_enabled or settings.one_click_unsubscribe_enabled:
+        if not _tracking_host_reachable():
+            logger.critical(
+                "TRACKING HOST UNREACHABLE: %s does not resolve, but tracking_enabled=%s / "
+                "one_click_unsubscribe_enabled=%s — emails would ship dead tracking/unsubscribe "
+                "links. Set a reachable TRACKING_BASE_URL or disable these flags.",
+                settings.tracking_base_url, settings.tracking_enabled,
+                settings.one_click_unsubscribe_enabled,
+            )
+        else:
+            logger.info("Tracking host reachable: %s", settings.tracking_base_url)
+    else:
+        logger.info(
+            "Tracking + one-click unsubscribe disabled; using mailto unsubscribe "
+            "(reachable TRACKING_BASE_URL not required).",
+        )
     yield
     # Shutdown
     await engine.dispose()

@@ -28,13 +28,6 @@ def build_tracked_email(
     Returns:
         Tuple of (html_body, plain_text_body)
     """
-    if not settings.tracking_enabled:
-        # Tracking disabled - return as-is
-        if is_html:
-            return body, html_to_plain_text(body)
-        else:
-            return plain_text_to_html(body), body
-
     base_url = settings.tracking_base_url
 
     # Convert to HTML if needed
@@ -45,40 +38,38 @@ def build_tracked_email(
         html_body = plain_text_to_html(body)
         plain_body = body
 
-    # Wrap links for click tracking
-    html_body = wrap_links_for_tracking(html_body, base_url, sent_email_id)
+    # ── Open/click TRACKING — gated by tracking_enabled (NOT compliance) ──
+    # Only the pixel + click-wrapping depend on tracking being on. The
+    # unsubscribe + CAN-SPAM footer below are ALWAYS added (Wave 0 fix: they
+    # were previously skipped whenever tracking_enabled was false).
+    if settings.tracking_enabled:
+        html_body = wrap_links_for_tracking(html_body, base_url, sent_email_id)
+        tracking_pixel_url = generate_tracking_pixel_url(base_url, sent_email_id)
+        tracking_pixel = f'<img src="{tracking_pixel_url}" width="1" height="1" alt="" style="display:none;border:0;width:1px;height:1px;" />'
+        if '</body>' in html_body.lower():
+            html_body = re.sub(r'(</body>)', f'{tracking_pixel}\\1', html_body, flags=re.IGNORECASE)
+        else:
+            html_body = f"{html_body}\n{tracking_pixel}"
 
-    # Add tracking pixel at the end
-    tracking_pixel_url = generate_tracking_pixel_url(base_url, sent_email_id)
-    tracking_pixel = f'<img src="{tracking_pixel_url}" width="1" height="1" alt="" style="display:none;border:0;width:1px;height:1px;" />'
-
-    # Insert before closing body tag if present, otherwise append
-    if '</body>' in html_body.lower():
-        html_body = re.sub(
-            r'(</body>)',
-            f'{tracking_pixel}\\1',
-            html_body,
-            flags=re.IGNORECASE
-        )
+    # ── ALWAYS: visible unsubscribe + CAN-SPAM postal address (compliance) ──
+    # Prefer the one-click HTTPS unsubscribe ONLY when explicitly enabled (a
+    # reachable tracking host exists); otherwise use the mailto unsubscribe so we
+    # never render a dead link (track.telnyx.com is NXDOMAIN — Wave 0 interim).
+    if settings.one_click_unsubscribe_enabled and enrollment_id:
+        unsub_target = generate_unsubscribe_url(base_url, enrollment_id)
     else:
-        html_body = f"{html_body}\n{tracking_pixel}"
+        unsub_target = settings.unsubscribe_mailto
+    html_body = add_unsubscribe_link(html_body, unsub_target)
 
-    # Add unsubscribe link (CAN-SPAM / RFC 8058 requirement)
-    if enrollment_id:
-        unsub_url = generate_unsubscribe_url(base_url, enrollment_id)
-        html_body = add_unsubscribe_link(html_body, unsub_url)
-
-    # CAN-SPAM physical mailing address
-    footer = '<p style="font-size:11px;color:#999;margin-top:20px;">Telnyx LLC, 311 W 43rd St, New York, NY 10036</p>'
+    footer = f'<p style="font-size:11px;color:#999;margin-top:20px;">{html.escape(settings.physical_address)}</p>'
     if '</body>' in html_body.lower():
-        html_body = re.sub(
-            r'(</body>)',
-            f'{footer}\\1',
-            html_body,
-            flags=re.IGNORECASE,
-        )
+        html_body = re.sub(r'(</body>)', f'{footer}\\1', html_body, flags=re.IGNORECASE)
     else:
         html_body = f"{html_body}\n{footer}"
+
+    # Mirror compliance content into the plain-text part too.
+    _unsub_plain = unsub_target[len("mailto:"):] if unsub_target.startswith("mailto:") else unsub_target
+    plain_body = f"{plain_body}\n\n--\nUnsubscribe: {_unsub_plain}\n{settings.physical_address}"
 
     return html_body, plain_body
 

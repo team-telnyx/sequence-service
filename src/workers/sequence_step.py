@@ -194,9 +194,16 @@ async def process_sequence_step(
             enrollment_id=enrollment.id,
         )
         
-        # Build RFC 8058 List-Unsubscribe header
-        unsub_url = generate_unsubscribe_url(settings.tracking_base_url, enrollment.id)
-        list_unsubscribe = f"<{unsub_url}>, <mailto:unsubscribe@telnyx.com?subject=unsubscribe>"
+        # Build RFC 8058 List-Unsubscribe header. Advertise the one-click HTTPS
+        # endpoint ONLY when it's reachable (one_click_unsubscribe_enabled);
+        # otherwise mailto-only, so we never advertise a dead one-click URL
+        # (track.telnyx.com is NXDOMAIN — Wave 0 interim).
+        mailto_unsub = "<mailto:unsubscribe@telnyx.com?subject=unsubscribe>"
+        if settings.one_click_unsubscribe_enabled:
+            unsub_url = generate_unsubscribe_url(settings.tracking_base_url, enrollment.id)
+            list_unsubscribe = f"<{unsub_url}>, {mailto_unsub}"
+        else:
+            list_unsubscribe = mailto_unsub
 
         # Send email via Gmail API
         if settings.gmail_enabled:
@@ -209,6 +216,7 @@ async def process_sequence_step(
                     plain_text_fallback=plain_body,
                     sender_name=mailbox.display_name,
                     list_unsubscribe=list_unsubscribe,
+                    one_click=settings.one_click_unsubscribe_enabled,
                 )
                 gmail_message_id = result['message_id']
                 gmail_thread_id = result['thread_id']

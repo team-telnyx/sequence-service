@@ -160,6 +160,7 @@ class GmailService:
         sender_name: Optional[str] = None,
         plain_text_fallback: Optional[str] = None,
         list_unsubscribe: Optional[str] = None,
+        one_click: bool = False,
     ) -> dict:
         """Send an HTML email with optional plain text fallback."""
         message = self._build_email_message(
@@ -173,6 +174,7 @@ class GmailService:
             sender_name=sender_name,
             plain_text_fallback=plain_text_fallback,
             list_unsubscribe=list_unsubscribe,
+            one_click=one_click,
         )
 
         return self._send_message(message, thread_id)
@@ -189,6 +191,7 @@ class GmailService:
         sender_name: Optional[str] = None,
         plain_text_fallback: Optional[str] = None,
         list_unsubscribe: Optional[str] = None,
+        one_click: bool = False,
     ) -> EmailMessage:
         """Build an EmailMessage object."""
         message = EmailMessage()
@@ -209,10 +212,14 @@ class GmailService:
             message['In-Reply-To'] = message_id
             message['References'] = message_id
 
-        # RFC 8058 List-Unsubscribe headers
+        # RFC 8058 List-Unsubscribe headers. Only advertise One-Click when a
+        # reachable HTTPS unsubscribe endpoint exists (one_click=True); otherwise
+        # emit List-Unsubscribe (mailto) WITHOUT the -Post header, so we never
+        # claim a one-click endpoint that fails (track.telnyx.com is NXDOMAIN).
         if list_unsubscribe:
             message['List-Unsubscribe'] = list_unsubscribe
-            message['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
+            if one_click:
+                message['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
 
         if is_html:
             unique_token = f'<span style="color: #e0e0e0; font-size: 1px;">{uuid.uuid4()}</span>'

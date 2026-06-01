@@ -21,6 +21,8 @@ from src.models.models import (
 )
 from src.services.queue import queue_sequence_step
 from src.services.mailbox_rotation import select_mailbox
+from src.models.models import Mailbox, MailboxStatus
+from src.config import validate_mailbox_for_tenant
 
 logger = structlog.get_logger()
 
@@ -38,6 +40,11 @@ class EnrollmentCreate(BaseModel):
     contact_email: EmailStr
     contact_name: Optional[str] = None
     timezone: Optional[str] = None  # IANA timezone, e.g. "Australia/Sydney"
+    # Optional: region-routed sticky sender chosen by Scout's MailboxRouter.
+    # When set + allowed + ACTIVE + has capacity, the enrollment sticks to THIS
+    # mailbox instead of weighted-random rotation. Invalid/at-capacity/not-active
+    # falls back to rotation (logged) — never a hard failure, so sends never stop.
+    sender_email: Optional[EmailStr] = None
     # Optional: Scout-composed email content (overrides step template)
     email_subject: Optional[str] = None
     email_body: Optional[str] = None  # HTML content from Scout composition (legacy T1 only)
@@ -149,8 +156,51 @@ async def create_enrollment(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Contact already enrolled in this sequence")
     
-    # Select mailbox for sticky sender (assigned once, used for all steps)
-    mailbox = await select_mailbox(db, tenant_id)
+    # Select mailbox for sticky sender (assigned once, used for all steps).
+    # If Scout passed a region-routed sender_email, honor it as the sticky
+    # sender when it is allowlisted for the tenant, ACTIVE, and has capacity;
+    # otherwise fall back to weighted-random rotation (never hard-fail, so a
+    # stale/at-capacity hint can't stop sending).
+    mailbox = None
+    if data.sender_email:
+        requested = str(data.sender_email).lower()
+        allowed = False
+        try:
+            allowed = validate_mailbox_for_tenant(tenant_id, requested)
+        except ValueError as exc:
+            logger.warning(
+                "sender_email not allowed for tenant — falling back to rotation",
+                tenant_id=tenant_id, sender_email=requested, error=str(exc),
+            )
+        if allowed:
+            result = await db.execute(
+                select(Mailbox).where(
+                    Mailbox.tenant_id == tenant_id,
+                    Mailbox.email == requested,
+                    Mailbox.status == MailboxStatus.ACTIVE,
+                )
+            )
+            candidate = result.scalar_one_or_none()
+            if candidate is None:
+                logger.warning(
+                    "sender_email has no ACTIVE mailbox row — falling back to rotation",
+                    tenant_id=tenant_id, sender_email=requested,
+                )
+            elif (candidate.daily_send_limit - candidate.sent_today) < 1:
+                logger.warning(
+                    "sender_email mailbox at capacity — falling back to rotation",
+                    tenant_id=tenant_id, sender_email=requested,
+                    sent_today=candidate.sent_today, daily_send_limit=candidate.daily_send_limit,
+                )
+            else:
+                mailbox = candidate
+                logger.info(
+                    "Honoring region-routed sender_email as sticky sender",
+                    tenant_id=tenant_id, sender_email=requested, mailbox_id=mailbox.id,
+                )
+
+    if mailbox is None:
+        mailbox = await select_mailbox(db, tenant_id)
     if not mailbox:
         raise HTTPException(status_code=503, detail="No available mailboxes for sending")
     

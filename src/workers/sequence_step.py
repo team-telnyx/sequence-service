@@ -17,7 +17,7 @@ from src.models.models import (
 from src.services.email_builder import build_tracked_email
 from src.api.tracking import generate_unsubscribe_url
 from src.services.gmail import GmailService, GmailError
-from src.services.mailbox_rotation import select_mailbox, reserve_send
+from src.services.mailbox_rotation import select_mailbox, reserve_send, release_send
 from src.services.queue import queue_sequence_step
 from src.services.template import render_email
 from src.services.circuit_breaker import check_circuit_breaker
@@ -233,6 +233,12 @@ async def process_sequence_step(
                 )
             except GmailError as e:
                 logger.error("Gmail send failed", error=str(e))
+                # F5: the send failed — give the reserved capacity slot back so a
+                # failed/bounced attempt doesn't permanently throttle the mailbox.
+                try:
+                    await release_send(db, mailbox.id)
+                except Exception as rel_err:  # never mask the original failure
+                    logger.warning("Failed to release send slot", error=str(rel_err))
                 raise RuntimeError(f"Gmail send failed: {e}")
         else:
             # Stub mode - generate fake message ID

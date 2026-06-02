@@ -65,25 +65,40 @@ async def select_mailbox(
 
 async def reserve_send(db: AsyncSession, mailbox_id: str) -> bool:
     """
-    Reserve a send slot by incrementing sent_today.
-    
-    Returns False if mailbox is at capacity.
+    Atomically reserve a send slot.
+
+    F4: a single conditional UPDATE (sent_today += 1 WHERE sent_today <
+    daily_send_limit) instead of SELECT-then-increment, so concurrent workers
+    can never both read the same sent_today and over-send past the daily limit.
+    rowcount == 1 means we got a slot; 0 means the mailbox was at capacity (or
+    not found).
     """
     result = await db.execute(
-        select(Mailbox).where(Mailbox.id == mailbox_id)
+        update(Mailbox)
+        .where(
+            Mailbox.id == mailbox_id,
+            Mailbox.sent_today < Mailbox.daily_send_limit,
+        )
+        .values(sent_today=Mailbox.sent_today + 1)
     )
-    mailbox = result.scalar_one_or_none()
-    
-    if not mailbox:
-        return False
-    
-    if mailbox.sent_today >= mailbox.daily_send_limit:
-        return False
-    
-    mailbox.sent_today += 1
     await db.commit()
-    
-    return True
+    return result.rowcount == 1
+
+
+async def release_send(db: AsyncSession, mailbox_id: str) -> None:
+    """
+    Release a previously-reserved send slot (sent_today -= 1, floored at 0).
+
+    F5: reserve_send runs before the Gmail send so we respect the cap up front,
+    but a failed send must NOT permanently consume capacity. Callers release the
+    slot when the send fails. Floored at 0 so a double-release never goes negative.
+    """
+    await db.execute(
+        update(Mailbox)
+        .where(Mailbox.id == mailbox_id, Mailbox.sent_today > 0)
+        .values(sent_today=Mailbox.sent_today - 1)
+    )
+    await db.commit()
 
 
 async def reset_all_sent_today(db: AsyncSession, tenant_id: str) -> int:

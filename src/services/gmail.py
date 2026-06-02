@@ -399,6 +399,9 @@ class GmailService:
                         continue
                     
                     # This is a reply from someone else
+                    # Classify bounce/OOO here (F6): signal_detection reads
+                    # reply['is_bounce']/['is_ooo']; without these keys every
+                    # mailer-daemon bounce was recorded as a plain REPLY.
                     replies.append({
                         'message_id': msg['id'],
                         'thread_id': msg['threadId'],
@@ -407,6 +410,8 @@ class GmailService:
                         'date': headers.get('date', ''),
                         'snippet': msg.get('snippet', ''),
                         'label_ids': msg.get('labelIds', []),
+                        'is_bounce': self.detect_bounce(msg),
+                        'is_ooo': self.detect_out_of_office(msg),
                     })
                     
             except GmailAPIError:

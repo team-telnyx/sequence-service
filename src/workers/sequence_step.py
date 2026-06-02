@@ -121,7 +121,26 @@ async def process_sequence_step(
                 status=enrollment_step.status,
             )
             return {"skipped": True, "reason": "step_not_ready"}
-        
+
+        # F3 idempotency (at-most-once): a SentEmail row is committed BEFORE the
+        # Gmail call (below), so its presence means a prior attempt already
+        # reached the send. On an arq retry (e.g. the SENT status was rolled back
+        # by a crash after Gmail delivered) we must NOT send again — a duplicate
+        # to a prospect is worse than a rare missed follow-up. A *known* GmailError
+        # removes its marker (see below), so only a hard crash mid-send leaves one.
+        existing_send = await db.execute(
+            select(SentEmail.id).where(SentEmail.enrollment_step_id == enrollment_step.id).limit(1)
+        )
+        if existing_send.scalar_one_or_none() is not None:
+            logger.warning(
+                "Idempotency: send already attempted for step — skipping re-send",
+                enrollment_step_id=enrollment_step_id,
+            )
+            if enrollment_step.status != EnrollmentStepStatus.SENT:
+                enrollment_step.status = EnrollmentStepStatus.SENT
+                await db.commit()
+            return {"skipped": True, "reason": "already_sent"}
+
         # Use enrollment's sticky mailbox (assigned at enrollment time)
         from src.models.models import Mailbox
         from src.config import validate_mailbox_for_tenant
@@ -183,8 +202,13 @@ async def process_sequence_step(
             sent_at=datetime.utcnow(),
         )
         db.add(sent_email)
-        await db.flush()  # Get the ID assigned
-        
+        # F3: COMMIT the marker BEFORE the Gmail send (was a non-durable flush).
+        # If the worker crashes after Gmail delivers but before the final commit,
+        # this row survives → the idempotency pre-check above skips the retry
+        # (at-most-once). A known GmailError below deletes it so the step stays
+        # retryable.
+        await db.commit()
+
         # Build tracked HTML email (with unsubscribe link + CAN-SPAM footer)
         # Note: step.body contains HTML content (with <p>, <br>, etc.)
         html_body, plain_body = build_tracked_email(
@@ -233,6 +257,16 @@ async def process_sequence_step(
                 )
             except GmailError as e:
                 logger.error("Gmail send failed", error=str(e))
+                # F3: a known GmailError means it did NOT deliver — remove the
+                # pre-send marker so the step stays retryable (otherwise a
+                # transient SMTP error would permanently skip the prospect under
+                # the at-most-once pre-check). Hard crashes (no except) keep the
+                # marker → at-most-once.
+                try:
+                    await db.delete(sent_email)
+                    await db.commit()
+                except Exception as del_err:
+                    logger.warning("Failed to remove send marker", error=str(del_err))
                 # F5: the send failed — give the reserved capacity slot back so a
                 # failed/bounced attempt doesn't permanently throttle the mailbox.
                 try:

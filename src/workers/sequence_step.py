@@ -28,6 +28,16 @@ settings = get_settings()
 logger = structlog.get_logger()
 
 
+def _blank_content(subject, body) -> bool:
+    """True if an email would render blank (audit C2 / REVOPS-886).
+
+    The Old/New-ICP step templates store '{{subject}}'/'{{body}}' placeholders that
+    render to '' when Scout content is absent; we must never send such a blank
+    email. Treats None / empty / whitespace-only subject OR body as blank.
+    """
+    return not (subject or "").strip() or not (body or "").strip()
+
+
 async def process_sequence_step(
     ctx: dict,
     enrollment_step_id: str,
@@ -181,7 +191,25 @@ async def process_sequence_step(
                 contact_email=enrollment.contact_email,
             )
             logger.info("Using step template", enrollment_step_id=enrollment_step_id)
-        
+
+        # REVOPS-886 (audit C2): send-side safety net. Never emit a blank email.
+        # The Old/New-ICP step templates store '{{subject}}'/'{{body}}' placeholders
+        # that render to empty when Scout content is absent; combined with an
+        # upstream miss this delivered blank emails to real prospects. Skip (do NOT
+        # send) if the resolved subject OR body is empty after rendering, and log
+        # loudly so it's alertable.
+        if _blank_content(subject, body):
+            logger.error(
+                "Blocking BLANK email send (empty subject or body after render)",
+                enrollment_step_id=enrollment_step_id,
+                enrollment_id=enrollment.id,
+                to_email=enrollment.contact_email,
+                has_custom=bool(enrollment_step.custom_subject and enrollment_step.custom_body),
+            )
+            enrollment_step.status = EnrollmentStepStatus.SKIPPED
+            await db.commit()
+            return {"skipped": True, "reason": "empty_content_blocked"}
+
         import uuid
         from datetime import datetime
         

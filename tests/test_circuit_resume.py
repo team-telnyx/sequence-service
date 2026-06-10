@@ -120,3 +120,39 @@ async def test_only_circuit_breaker_pauses_resumed(seeded, session_factory):
     assert out["resumed"] == 0
     e = await _enr(session_factory, "e4")
     assert e.status == EnrollmentStatus.PAUSED and e.pause_reason == "reply"
+
+
+@pytest.mark.asyncio
+async def test_defers_when_mailbox_at_capacity(seeded, session_factory):
+    # mb-full is sent_today=50 / cap=50 → spare 0 → resume nothing (yield to
+    # in-flight enrollments), even though the mailbox is cool.
+    await _make_paused(session_factory, seeded, enr_id="ef", mailbox_id=seeded["full_mailbox_id"])
+    q = AsyncMock()
+    cms = _patches(session_factory, 0.0, q)
+    _run(cms)
+    try:
+        out = await cr.resume_circuit_breaker_paused({})
+    finally:
+        _stop(cms)
+    assert out["resumed"] == 0 and out["skipped_full"] == 1
+    e = await _enr(session_factory, "ef")
+    assert e.status == EnrollmentStatus.PAUSED
+    q.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_per_run_cap_limits_resume(seeded, session_factory, monkeypatch):
+    # mb-active has spare 40 (sent 10 / cap 50); with per-run cap 3 and 8 paused,
+    # only 3 resume this run (the rest trickle on later runs).
+    monkeypatch.setattr(cr.settings, "circuit_breaker_resume_per_run", 3, raising=False)
+    for i in range(8):
+        await _make_paused(session_factory, seeded, enr_id=f"pc{i}",
+                           mailbox_id=seeded["active_mailbox_id"])
+    q = AsyncMock(return_value="j")
+    cms = _patches(session_factory, 0.0, q)
+    _run(cms)
+    try:
+        out = await cr.resume_circuit_breaker_paused({})
+    finally:
+        _stop(cms)
+    assert out["resumed"] == 3

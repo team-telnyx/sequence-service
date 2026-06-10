@@ -1,11 +1,12 @@
 """ARQ worker configuration and task definitions."""
 
 import asyncio
-from arq import create_pool
+from arq import create_pool, cron
 from arq.connections import RedisSettings
 import structlog
 
 from src.config import get_settings
+from src.workers.reconcile import reconcile_scheduled_steps
 from src.workers.sequence_step import process_sequence_step
 from src.workers.signal_detection import detect_signals, detect_signals_all_mailboxes
 from src.workers.webhook_delivery import deliver_webhook
@@ -33,8 +34,16 @@ class WorkerSettings:
         detect_signals,
         detect_signals_all_mailboxes,
         deliver_webhook,
+        reconcile_scheduled_steps,
     ]
-    
+
+    # Re-enqueue enrollment steps stranded in SCHEDULED by a lost arq job (M4).
+    # Runs every 10 min; the reconciler's grace window (>10 min) ensures it never
+    # races a step that is simply waiting on its defer.
+    cron_jobs = [
+        cron(reconcile_scheduled_steps, minute=set(range(0, 60, 10)), run_at_startup=False),
+    ]
+
     on_startup = startup
     on_shutdown = shutdown
     

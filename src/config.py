@@ -73,7 +73,14 @@ class Settings(BaseSettings):
     
     # Workers
     worker_concurrency: int = 10
-    
+
+    # Stuck-step reconciler (audit M4): re-enqueue SCHEDULED steps whose arq job
+    # was lost. A step is reconciled once it is this many seconds past due (or has
+    # no scheduled_at). Kept above the max step jitter so we never race a job that
+    # is simply waiting on its defer.
+    reconcile_grace_seconds: int = 900
+    reconcile_batch_limit: int = 200
+
     # Circuit Breaker
     circuit_breaker_enabled: bool = True
     circuit_breaker_threshold: float = 0.10

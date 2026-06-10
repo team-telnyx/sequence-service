@@ -17,6 +17,7 @@ from src.models.base import async_session
 from src.models.models import (
     EnrollmentStatus,
     EnrollmentStepStatus,
+    Mailbox,
     Sequence,
     SequenceEnrollment,
     SequenceEnrollmentStep,
@@ -29,14 +30,20 @@ settings = get_settings()
 logger = structlog.get_logger()
 
 
-async def _resume_mailbox(db, mailbox_id: str) -> int:
-    """Resume a mailbox's circuit_breaker-paused enrollments + re-queue next step."""
+async def _resume_mailbox(db, mailbox_id: str, limit: int) -> int:
+    """Resume up to `limit` of a mailbox's circuit_breaker-paused enrollments +
+    re-queue next step. `limit` is the spare daily capacity, so resumed work only
+    fills headroom and never crowds out in-flight enrollments (consistency)."""
+    if limit <= 0:
+        return 0
     enrollments = (await db.execute(
         select(SequenceEnrollment).where(
             SequenceEnrollment.mailbox_id == mailbox_id,
             SequenceEnrollment.status == EnrollmentStatus.PAUSED,
             SequenceEnrollment.pause_reason == "circuit_breaker",
         )
+        .order_by(SequenceEnrollment.created_at)  # oldest-paused first
+        .limit(limit)
     )).scalars().all()
 
     resumed = 0
@@ -81,7 +88,8 @@ async def _resume_mailbox(db, mailbox_id: str) -> int:
 async def resume_circuit_breaker_paused(ctx: dict) -> dict:
     """Cron: resume circuit_breaker-paused enrollments on recovered mailboxes."""
     resume_threshold = getattr(settings, "circuit_breaker_resume_threshold", 0.06)
-    resumed = checked = skipped_hot = 0
+    per_run_cap = getattr(settings, "circuit_breaker_resume_per_run", 10)
+    resumed = checked = skipped_hot = skipped_full = 0
 
     async with async_session() as db:
         mailboxes = (await db.execute(
@@ -103,8 +111,24 @@ async def resume_circuit_breaker_paused(ctx: dict) -> dict:
                 logger.info("circuit_resume: mailbox still elevated, staying paused",
                             mailbox_id=mailbox_id, bounce_rate=rate, resume_threshold=resume_threshold)
                 continue
-            resumed += await _resume_mailbox(db, mailbox_id)
+            # Capacity-aware: only resume into SPARE daily capacity, capped per run,
+            # so the backlog trickles in behind in-flight enrollments instead of
+            # crowding them out of the shared mailbox cap (consistency requirement).
+            mbx = (await db.execute(
+                select(Mailbox).where(Mailbox.id == mailbox_id)
+            )).scalar_one_or_none()
+            spare = max(0, (mbx.daily_send_limit - mbx.sent_today)) if mbx else 0
+            limit = min(per_run_cap, spare)
+            if limit <= 0:
+                skipped_full += 1
+                logger.info("circuit_resume: mailbox at capacity, deferring resume",
+                            mailbox_id=mailbox_id, sent_today=getattr(mbx, "sent_today", None),
+                            daily_send_limit=getattr(mbx, "daily_send_limit", None))
+                continue
+            resumed += await _resume_mailbox(db, mailbox_id, limit)
 
     logger.info("resume_circuit_breaker_paused complete",
-                resumed=resumed, mailboxes_checked=checked, skipped_hot=skipped_hot)
-    return {"resumed": resumed, "mailboxes_checked": checked, "skipped_hot": skipped_hot}
+                resumed=resumed, mailboxes_checked=checked,
+                skipped_hot=skipped_hot, skipped_full=skipped_full)
+    return {"resumed": resumed, "mailboxes_checked": checked,
+            "skipped_hot": skipped_hot, "skipped_full": skipped_full}

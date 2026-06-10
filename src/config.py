@@ -89,7 +89,11 @@ class Settings(BaseSettings):
     # bounce rate cools below this (hysteresis margin under the 0.10 trip line, so
     # a still-elevated mailbox like 8.5% stays paused instead of resuming + re-tripping).
     circuit_breaker_resume_threshold: float = 0.06
-    
+    # Max enrollments to resume per mailbox per run, and never more than the
+    # mailbox's spare daily capacity — so a recovered backlog trickles in behind
+    # in-flight enrollments rather than crowding them out of the shared send cap.
+    circuit_breaker_resume_per_run: int = 10
+
     # Send Window
     send_window_enabled: bool = True
     send_window_start: int = 8   # 8am

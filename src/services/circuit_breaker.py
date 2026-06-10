@@ -1,6 +1,7 @@
 """Circuit breaker: auto-pause enrollments when mailbox bounce rate is too high."""
 
 from datetime import datetime, timedelta
+from typing import Optional
 
 import structlog
 from sqlalchemy import select, func
@@ -19,6 +20,33 @@ logger = structlog.get_logger()
 settings = get_settings()
 
 
+async def mailbox_bounce_rate(db: AsyncSession, mailbox_id: str) -> Optional[float]:
+    """Bounce rate for a mailbox over the circuit-breaker window.
+
+    Returns None when there are no sends in the window (no signal either way).
+    Shared by the breaker (pause) and the auto-resume so both use one definition.
+    """
+    window_start = datetime.utcnow() - timedelta(hours=settings.circuit_breaker_window_hours)
+    total_sends = (await db.execute(
+        select(func.count(SentEmail.id)).where(
+            SentEmail.mailbox_id == mailbox_id,
+            SentEmail.sent_at >= window_start,
+        )
+    )).scalar() or 0
+    if total_sends == 0:
+        return None
+    bounce_count = (await db.execute(
+        select(func.count(Signal.id))
+        .join(SentEmail, Signal.sent_email_id == SentEmail.id)
+        .where(
+            SentEmail.mailbox_id == mailbox_id,
+            SentEmail.sent_at >= window_start,
+            Signal.type == SignalType.BOUNCE,
+        )
+    )).scalar() or 0
+    return bounce_count / total_sends
+
+
 async def check_circuit_breaker(db: AsyncSession, mailbox_id: str, tenant_id: str) -> bool:
     """
     Check if the mailbox's bounce rate exceeds the threshold.
@@ -29,34 +57,9 @@ async def check_circuit_breaker(db: AsyncSession, mailbox_id: str, tenant_id: st
     if not settings.circuit_breaker_enabled:
         return False
 
-    window_start = datetime.utcnow() - timedelta(hours=settings.circuit_breaker_window_hours)
-
-    # Count total sends in window
-    total_result = await db.execute(
-        select(func.count(SentEmail.id))
-        .where(
-            SentEmail.mailbox_id == mailbox_id,
-            SentEmail.sent_at >= window_start,
-        )
-    )
-    total_sends = total_result.scalar() or 0
-
-    if total_sends == 0:
+    bounce_rate = await mailbox_bounce_rate(db, mailbox_id)
+    if bounce_rate is None:
         return False
-
-    # Count bounces in window
-    bounce_result = await db.execute(
-        select(func.count(Signal.id))
-        .join(SentEmail, Signal.sent_email_id == SentEmail.id)
-        .where(
-            SentEmail.mailbox_id == mailbox_id,
-            SentEmail.sent_at >= window_start,
-            Signal.type == SignalType.BOUNCE,
-        )
-    )
-    bounce_count = bounce_result.scalar() or 0
-
-    bounce_rate = bounce_count / total_sends
 
     if bounce_rate >= settings.circuit_breaker_threshold:
         logger.warning(
@@ -64,8 +67,6 @@ async def check_circuit_breaker(db: AsyncSession, mailbox_id: str, tenant_id: st
             mailbox_id=mailbox_id,
             bounce_rate=bounce_rate,
             threshold=settings.circuit_breaker_threshold,
-            total_sends=total_sends,
-            bounce_count=bounce_count,
         )
         await _pause_enrollments_for_mailbox(db, mailbox_id, tenant_id)
         return True

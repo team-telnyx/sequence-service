@@ -6,6 +6,7 @@ from arq.connections import RedisSettings
 import structlog
 
 from src.config import get_settings
+from src.workers.circuit_resume import resume_circuit_breaker_paused
 from src.workers.reconcile import reconcile_scheduled_steps
 from src.workers.sequence_step import process_sequence_step
 from src.workers.signal_detection import detect_signals, detect_signals_all_mailboxes
@@ -35,13 +36,16 @@ class WorkerSettings:
         detect_signals_all_mailboxes,
         deliver_webhook,
         reconcile_scheduled_steps,
+        resume_circuit_breaker_paused,
     ]
 
-    # Re-enqueue enrollment steps stranded in SCHEDULED by a lost arq job (M4).
-    # Runs every 10 min; the reconciler's grace window (>10 min) ensures it never
-    # races a step that is simply waiting on its defer.
     cron_jobs = [
+        # Re-enqueue steps stranded in SCHEDULED by a lost arq job (M4). Every 10 min;
+        # the >10 min grace window ensures it never races a step waiting on its defer.
         cron(reconcile_scheduled_steps, minute=set(range(0, 60, 10)), run_at_startup=False),
+        # Un-pause circuit_breaker-paused enrollments once the mailbox bounce rate
+        # cools below the resume threshold. Every 30 min (offset from the reconciler).
+        cron(resume_circuit_breaker_paused, minute={5, 35}, run_at_startup=False),
     ]
 
     on_startup = startup

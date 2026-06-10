@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     circuit_breaker_enabled: bool = True
     circuit_breaker_threshold: float = 0.10
     circuit_breaker_window_hours: int = 24
+    # Auto-resume: un-pause circuit_breaker-paused enrollments once the mailbox
+    # bounce rate cools below this (hysteresis margin under the 0.10 trip line, so
+    # a still-elevated mailbox like 8.5% stays paused instead of resuming + re-tripping).
+    circuit_breaker_resume_threshold: float = 0.06
     
     # Send Window
     send_window_enabled: bool = True

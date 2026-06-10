@@ -233,6 +233,9 @@ async def create_enrollment(
             enrollment_id=enrollment.id,
             step_id=step.id,
             status=EnrollmentStepStatus.SCHEDULED if i == 0 else EnrollmentStepStatus.PENDING,
+            # First step is queued for immediate processing; record scheduled_at
+            # so the reconciler can recover it if its arq job is lost (audit M4).
+            scheduled_at=datetime.utcnow() if i == 0 else None,
             custom_subject=composed.subject if composed else None,
             custom_body=composed.body if composed else None,
         )

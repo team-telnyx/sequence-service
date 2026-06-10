@@ -1,6 +1,8 @@
 """Sequence step processing worker."""
 
 import random
+from datetime import datetime, timedelta
+
 import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -408,8 +410,10 @@ async def _queue_next_step(
         delay_seconds = max(0, delay_seconds + jitter)
         logger.info("Applied send jitter", jitter_seconds=jitter, total_delay=delay_seconds)
     
-    # Mark as scheduled
+    # Mark as scheduled. Record scheduled_at so a lost arq job can be detected
+    # and reconciled (audit M4) — previously this column was never written.
     next_enrollment_step.status = EnrollmentStepStatus.SCHEDULED
+    next_enrollment_step.scheduled_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
     await db.commit()
     
     # Queue the next step

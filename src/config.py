@@ -1,22 +1,21 @@
 """Configuration management for Sequence Service."""
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
 
 # =============================================================
 # HARDCODED MAILBOX ALLOCATION — DO NOT MODIFY WITHOUT APPROVAL
 # =============================================================
-# Quinn and Scout have dedicated mailbox pools.
-# These cannot be bypassed. Tenant isolation enforces this at
-# the API layer; these constants enforce it in code.
+# Scout-only deployment (REVOPS-972 / M4 / QC-4). The service runs a single
+# tenant (tenant-scout) and sends ONLY through the 8 Scout sender inboxes
+# quinn.c–quinn.j. The Quinn pool, the multi-tenant TENANT_MAILBOX_MAP, and the
+# unknown-tenant ALL_ALLOWED_MAILBOXES fallback are removed: a single
+# SCOUT_MAILBOXES membership check (validate_mailbox_for_tenant, below) is the
+# in-code safety net even if the DB is misconfigured, with NO escape hatch.
+# (quinn.c–j are physical inboxes owned by Scout; the "quinn." local-part is
+# legacy naming, not the retired tenant-quinn pool.)
 # =============================================================
-
-QUINN_MAILBOXES = frozenset({
-    "quinn@telnyx.com",
-    "quinn.a@telnyx.com",
-    "quinn.b@telnyx.com",
-})
 
 SCOUT_MAILBOXES = frozenset({
     "quinn.c@telnyx.com",
@@ -29,29 +28,45 @@ SCOUT_MAILBOXES = frozenset({
     "quinn.j@telnyx.com",
 })
 
-ALL_ALLOWED_MAILBOXES = QUINN_MAILBOXES | SCOUT_MAILBOXES
-
-TENANT_MAILBOX_MAP = {
-    "tenant-quinn": QUINN_MAILBOXES,
-    "tenant-scout": SCOUT_MAILBOXES,
-}
+# Transitional Scout-only shims. The Quinn pool and the unknown-tenant fallback
+# semantics are GONE — these intentionally resolve to ONLY the Scout pool. They
+# exist solely so services.mailbox_rotation keeps importing while its own
+# Scout-only collapse lands in the sibling mailbox-rotation workstream; both
+# names are DELETED once that merges (the membership check above is canonical).
+ALL_ALLOWED_MAILBOXES = SCOUT_MAILBOXES
+TENANT_MAILBOX_MAP = {"tenant-scout": SCOUT_MAILBOXES}
 # =============================================================
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment."""
-    
+
+    # extra='ignore' is REQUIRED (audit L1): plists set env the service does not
+    # read (SCOUT_API_KEY, SEQUENCE_SEND_MODE, GMAIL_MAILBOXES, ...). pydantic
+    # defaults to 'forbid', which would reject those and crash startup. NEVER
+    # set this to 'forbid'.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     # Database (local Postgres via Homebrew)
     database_url: str = "postgresql+asyncpg://kevinward@localhost:5432/sequence_service"
-    
+
     # Redis
     redis_url: str = "redis://localhost:6379"
-    
+
     # Gmail
     gmail_enabled: bool = False
-    gmail_service_account_file: str = "/Users/kevinward/.openclaw/workspace/quinn-v2/credentials/service-account.json"
-    gmail_delegated_user: str = "quinn@telnyx.com"
-    
+    # Scout-owned service-account path (REVOPS-972 / M5). Relocated off the
+    # retired quinn-v2 directory. NOTE: this updates the config DEFAULT only —
+    # the actual credentials file is physically moved to this path at cutover
+    # (maintenance window), not by this change. Domain-wide delegation must be
+    # confirmed for quinn.c–quinn.j before flip. Sends delegate per-inbox via
+    # gmail's with_subject(self.inbox); there is no single delegated user.
+    gmail_service_account_file: str = "/Users/kevinward/.openclaw-scout/credentials/service-account.json"
+
     # Tracking
     tracking_enabled: bool = True
     tracking_base_url: str = "http://localhost:8000"  # Override in production
@@ -66,11 +81,11 @@ class Settings(BaseSettings):
     # NOT advertise a dead one-click endpoint (track.telnyx.com is NXDOMAIN); the
     # mailto unsubscribe is used instead.
     one_click_unsubscribe_enabled: bool = False
-    
+
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000
-    
+
     # Workers
     worker_concurrency: int = 10
 
@@ -98,17 +113,13 @@ class Settings(BaseSettings):
     send_window_enabled: bool = True
     send_window_start: int = 8   # 8am
     send_window_end: int = 17    # 5pm
-    
+
     # Send Jitter
     send_jitter_enabled: bool = True
     send_jitter_minutes: int = 15
-    
+
     # Logging
     log_level: str = "INFO"
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
 
 @lru_cache
@@ -119,19 +130,20 @@ def get_settings() -> Settings:
 
 def validate_mailbox_for_tenant(tenant_id: str, email: str) -> bool:
     """
-    Validate that a mailbox email is allowed for a given tenant.
-    
-    Returns True if allowed, raises ValueError if not.
-    This is a hardcoded safety check — even if the DB is misconfigured,
-    this will block unauthorized mailbox usage.
+    Validate that a mailbox email is allowed to send.
+
+    Scout-only (REVOPS-972 / M4): the single allowed pool is SCOUT_MAILBOXES.
+    Returns True if allowed, raises ValueError otherwise. This is the hardcoded
+    safety check — even if the DB is misconfigured, it blocks any non-Scout
+    mailbox, and there is NO unknown-tenant fallback that could reach a mailbox.
+
+    `tenant_id` is retained in the signature for call-site compatibility
+    (enrollments.py, sequence_step.py) but the check is the same single Scout
+    allowlist regardless of tenant.
     """
-    allowed = TENANT_MAILBOX_MAP.get(tenant_id)
-    if allowed is None:
-        # Unknown tenant — allow any mailbox in ALL_ALLOWED_MAILBOXES
-        return email in ALL_ALLOWED_MAILBOXES
-    if email not in allowed:
+    if email not in SCOUT_MAILBOXES:
         raise ValueError(
-            f"Mailbox {email} is not allowed for tenant {tenant_id}. "
-            f"Allowed: {sorted(allowed)}"
+            f"Mailbox {email} is not an allowed Scout sender "
+            f"(tenant {tenant_id}). Allowed: {sorted(SCOUT_MAILBOXES)}"
         )
     return True

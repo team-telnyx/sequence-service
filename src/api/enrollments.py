@@ -1,10 +1,10 @@
 """Enrollment management endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, model_validator
 from typing import Optional
 from datetime import datetime
 import uuid
@@ -28,6 +28,16 @@ logger = structlog.get_logger()
 
 router = APIRouter()
 
+# How long (seconds) a 429 at-capacity caller should wait before retrying. The
+# daily mailbox cap resets at 00:05 UTC; an hour is a safe, conservative backoff
+# that never bypasses the cap and avoids hammering the API mid-day.
+CAPACITY_RETRY_AFTER_SECONDS = 3600
+
+# pause_reasons that must NOT be auto/manually resumed without an explicit force:
+# these mean the recipient took a terminal action (replied / bounced / opted out),
+# so re-activating would re-email someone we must not contact (REVOPS-972 B1).
+_PROTECTED_PAUSE_REASONS = frozenset({"reply", "bounce", "unsubscribe"})
+
 
 class EnrollmentStepContent(BaseModel):
     step_number: int
@@ -49,6 +59,19 @@ class EnrollmentCreate(BaseModel):
     email_subject: Optional[str] = None
     email_body: Optional[str] = None  # HTML content from Scout composition (legacy T1 only)
     composed_steps: Optional[list[EnrollmentStepContent]] = None  # All touches pre-composed
+    # External identity from the producer (Scout prospect id). Persisted on the
+    # enrollment and echoed back so reply/bounce signals join to the originating
+    # prospect deterministically (REVOPS-972 identity). `prospect_id` is accepted
+    # as an alias for the same value.
+    external_ref: Optional[str] = None
+    prospect_id: Optional[str] = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def _coalesce_external_ref(self):
+        # prospect_id is a caller-friendly alias; external_ref wins if both given.
+        if self.external_ref is None and self.prospect_id is not None:
+            self.external_ref = self.prospect_id
+        return self
 
 
 class EnrollmentUpdate(BaseModel):
@@ -63,6 +86,7 @@ class EnrollmentResponse(BaseModel):
     contact_name: Optional[str]
     status: EnrollmentStatus
     current_step: int
+    external_ref: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -202,6 +226,34 @@ async def create_enrollment(
     if mailbox is None:
         mailbox = await select_mailbox(db, tenant_id)
     if not mailbox:
+        # Distinguish a TRANSIENT at-capacity condition (every ACTIVE mailbox has
+        # already hit its daily cap — resolves at the next daily reset) from a true
+        # zero-active-mailbox INFRA failure (no ACTIVE mailbox row exists at all).
+        # The contract Scout relies on: 429 = retry later (do NOT burn an enroll
+        # attempt / OUT the account), 503 = infra (REVOPS-972 B2). The 75/day cap
+        # is never bypassed — we only change the status code we report.
+        active_count = (await db.execute(
+            select(func.count())
+            .select_from(Mailbox)
+            .where(
+                Mailbox.tenant_id == tenant_id,
+                Mailbox.status == MailboxStatus.ACTIVE,
+            )
+        )).scalar_one()
+        if active_count > 0:
+            logger.warning(
+                "All active mailboxes at capacity — returning 429",
+                tenant_id=tenant_id, active_mailboxes=active_count,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="All mailboxes are at their daily send capacity; retry later",
+                headers={"Retry-After": str(CAPACITY_RETRY_AFTER_SECONDS)},
+            )
+        logger.error(
+            "No ACTIVE mailboxes for tenant — returning 503",
+            tenant_id=tenant_id,
+        )
         raise HTTPException(status_code=503, detail="No available mailboxes for sending")
     
     # Create enrollment with assigned mailbox
@@ -212,6 +264,7 @@ async def create_enrollment(
         contact_email=data.contact_email,
         contact_name=data.contact_name,
         timezone=data.timezone or 'America/New_York',
+        external_ref=data.external_ref,
     )
     db.add(enrollment)
     
@@ -323,6 +376,7 @@ async def pause_enrollment(
         raise HTTPException(status_code=404, detail="Enrollment not found")
     
     enrollment.status = EnrollmentStatus.PAUSED
+    enrollment.pause_reason = "manual"
     await db.commit()
     
     return {"success": True}
@@ -333,8 +387,24 @@ async def resume_enrollment(
     enrollment_id: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    force: bool = Query(
+        False,
+        description=(
+            "Resume even when the enrollment was paused for a TERMINAL recipient "
+            "action (reply/bounce/unsubscribe). Without this, such a resume is "
+            "refused to avoid re-emailing someone we must not contact."
+        ),
+    ),
 ):
-    """Resume a paused enrollment."""
+    """Resume a paused enrollment.
+
+    Mirrors circuit_resume._resume_mailbox: a valid resume CLEARS pause_reason,
+    flips status to ACTIVE, and re-queues the next PENDING/SCHEDULED step so the
+    sequence actually progresses (the old TODO left it stalled). REFUSES (409) to
+    resume a reply/bounce/unsubscribe-paused enrollment unless `force=true`, so a
+    manual resume can't reopen the B1 re-email hazard outside the cron's guard
+    (REVOPS-972 B1).
+    """
     tenant_id = request.state.tenant_id
     
     result = await db.execute(
@@ -349,10 +419,57 @@ async def resume_enrollment(
     
     if not enrollment:
         raise HTTPException(status_code=404, detail="Enrollment not found")
-    
+
+    if enrollment.pause_reason in _PROTECTED_PAUSE_REASONS and not force:
+        logger.warning(
+            "Refusing to resume enrollment paused for a terminal action",
+            enrollment_id=enrollment_id, tenant_id=tenant_id,
+            pause_reason=enrollment.pause_reason,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Enrollment paused for '{enrollment.pause_reason}'; resuming would "
+                f"re-contact a recipient who took a terminal action. Pass force=true "
+                f"to override."
+            ),
+        )
+
     enrollment.status = EnrollmentStatus.ACTIVE
+    enrollment.pause_reason = None
+
+    # Re-queue the next PENDING/SCHEDULED step (lowest step_number) so the sequence
+    # actually advances after resume — mirroring circuit_resume._resume_mailbox.
+    nxt = (await db.execute(
+        select(SequenceEnrollmentStep)
+        .join(SequenceStep, SequenceStep.id == SequenceEnrollmentStep.step_id)
+        .where(
+            SequenceEnrollmentStep.enrollment_id == enrollment.id,
+            SequenceEnrollmentStep.status.in_(
+                [EnrollmentStepStatus.PENDING, EnrollmentStepStatus.SCHEDULED]),
+        )
+        .order_by(SequenceStep.step_number)
+        .limit(1)
+    )).scalar_one_or_none()
+    requeue_step_id = None
+    if nxt is not None:
+        nxt.status = EnrollmentStepStatus.SCHEDULED
+        nxt.scheduled_at = datetime.utcnow()
+        requeue_step_id = nxt.id
+
     await db.commit()
-    
-    # TODO: Re-queue pending steps via ARQ
-    
+
+    # Enqueue AFTER commit so the worker sees the ACTIVE/SCHEDULED rows. A queue
+    # failure must not undo the resume — the scheduled_at reconciler recovers it.
+    if requeue_step_id is not None:
+        try:
+            await queue_sequence_step(
+                enrollment_step_id=requeue_step_id, tenant_id=tenant_id, delay_seconds=None,
+            )
+        except Exception as exc:
+            logger.error(
+                "resume_enrollment: re-enqueue failed",
+                enrollment_step_id=requeue_step_id, error=str(exc),
+            )
+
     return {"success": True}

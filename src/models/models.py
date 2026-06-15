@@ -6,7 +6,17 @@ Mirrors the Prisma schema from the TypeScript version.
 import enum
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import ForeignKey, String, Text, Integer, Float, Boolean, Enum, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    String,
+    Text,
+    Integer,
+    Float,
+    Boolean,
+    Enum,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
@@ -138,7 +148,27 @@ class SequenceEnrollment(Base):
     timezone: Mapped[str] = mapped_column(String(63), default="America/New_York", server_default="America/New_York")
     status: Mapped[EnrollmentStatus] = mapped_column(Enum(EnrollmentStatus), default=EnrollmentStatus.ACTIVE)
     current_step: Mapped[int] = mapped_column(Integer, default=1)
-    pause_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # pause_reason: WHY an enrollment is PAUSED, constrained to a known set by a
+    # CHECK so a reply/bounce/unsubscribe pause is always identifiable and the
+    # circuit-resume worker / manual-resume endpoint can guard on it instead of
+    # treating an unconstrained string as resumable (REVOPS-972 B1/H5). The
+    # migration (orchestrator-owned) applies the CHECK to the live DB; this ORM
+    # mirrors that intent so create_all test DBs and the live schema agree.
+    # Nullable on purpose: an ACTIVE/resumed enrollment has NO pause reason
+    # (circuit_resume + the manual-resume endpoint both clear it to NULL). The
+    # CHECK constrains the *value* to the known set when present, so a typo/legacy
+    # reason can never slip in, while still allowing NULL for not-paused rows. The
+    # `default`/`server_default='manual'` only applies on INSERT when the caller
+    # omits it (an operator pause), never overriding an explicit reason. This is
+    # the durable B1 schema guard (REVOPS-972 H5) without breaking the resume path.
+    pause_reason: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, default=None,
+    )
+    # External identity from the producer (Scout prospect id). Nullable so legacy
+    # rows and non-Scout callers are unaffected; lets reply/bounce signals join back
+    # to the originating prospect deterministically instead of email-only matching
+    # (REVOPS-972 identity). DB column applied by migration 001.
+    external_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     
     # Relationships
     sequence: Mapped["Sequence"] = relationship(back_populates="enrollments")
@@ -147,6 +177,11 @@ class SequenceEnrollment(Base):
     
     __table_args__ = (
         UniqueConstraint("sequence_id", "contact_email", name="uq_enrollment_sequence_contact"),
+        CheckConstraint(
+            "pause_reason IS NULL OR pause_reason IN "
+            "('circuit_breaker', 'reply', 'unsubscribe', 'bounce', 'manual')",
+            name="ck_enrollment_pause_reason",
+        ),
     )
 
 

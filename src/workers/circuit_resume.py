@@ -49,6 +49,16 @@ async def _resume_mailbox(db, mailbox_id: str, limit: int) -> int:
     resumed = 0
     requeue = []  # (step_id, tenant_id) — enqueue AFTER commit so the job sees ACTIVE
     for e in enrollments:
+        # DEFENSE-IN-DEPTH: only circuit_breaker-paused rows may EVER be auto-
+        # resumed. reply / bounce / unsubscribe / manual / NULL rows must never
+        # be re-activated by this cron (a resumed replier = we re-email someone
+        # who already answered). The SELECT above already filters on
+        # pause_reason=='circuit_breaker'; this assert guarantees a future query
+        # regression can't silently widen that set (audit C1 / REVOPS-972 B).
+        assert e.pause_reason == "circuit_breaker", (
+            f"circuit_resume refused to resume enrollment {e.id} with "
+            f"pause_reason={e.pause_reason!r} (only circuit_breaker is resumable)"
+        )
         e.status = EnrollmentStatus.ACTIVE
         e.pause_reason = None
         nxt = (await db.execute(

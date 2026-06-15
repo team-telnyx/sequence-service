@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import logging
@@ -82,30 +83,38 @@ app.add_middleware(
 # Tenant authentication middleware
 @app.middleware("http")
 async def authenticate_tenant(request: Request, call_next):
-    """Extract and validate tenant from API key."""
+    """Extract and validate tenant from API key.
+
+    H4 (REVOPS-972): auth failures MUST return a JSONResponse directly. Raising
+    HTTPException from inside pure-http middleware is NOT translated by
+    Starlette's BaseHTTPMiddleware — it bubbles up as an unhandled exception and
+    the client receives HTTP 500. Returning a JSONResponse(401) lets Scout
+    distinguish an auth failure (don't retry) from a server error (retry) and
+    avoids retry storms.
+    """
     # Skip auth for health check and tracking endpoints
     if request.url.path == "/health" or request.url.path.startswith("/track/"):
         return await call_next(request)
-    
+
     api_key = request.headers.get("X-API-Key")
     if not api_key:
-        raise HTTPException(status_code=401, detail="Missing API key")
-    
+        return JSONResponse(status_code=401, content={"detail": "Missing API key"})
+
     # Look up tenant by API key
     from sqlalchemy import select
     from src.models.models import Tenant
-    
+
     async with async_session() as db:
         result = await db.execute(
             select(Tenant).where(Tenant.api_key == api_key)
         )
         tenant = result.scalar_one_or_none()
-    
+
     if not tenant:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
+        return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
+
     request.state.tenant_id = tenant.id
-    
+
     return await call_next(request)
 
 

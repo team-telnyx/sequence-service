@@ -55,8 +55,12 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
             logger.error("Mailbox not found", mailbox_id=mailbox_id)
             return {"error": "mailbox_not_found"}
         
-        # Get recent sent emails from this mailbox (last 7 days)
-        cutoff = datetime.utcnow() - timedelta(days=7)
+        # Get recent sent emails from this mailbox.
+        # Window must be >= the longest sequence span (21 days) so a LATE reply
+        # (e.g. 10 days after the touch that prompted it) is still matched to its
+        # thread and pauses the enrollment. A 7-day window let late repliers fall
+        # through and keep getting emailed (audit L3 / REVOPS-972 B).
+        cutoff = datetime.utcnow() - timedelta(days=21)
         result = await db.execute(
             select(SentEmail)
             .where(
@@ -152,6 +156,10 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
                 # Pause enrollment - they replied!
                 if enrollment.status == EnrollmentStatus.ACTIVE:
                     enrollment.status = EnrollmentStatus.PAUSED
+                    # Stamp the reason so the circuit-breaker resume cron NEVER
+                    # auto-resumes a replier. A NULL pause_reason here is a
+                    # reactivation landmine (audit C1 / REVOPS-972 B).
+                    enrollment.pause_reason = "reply"
                     logger.info(
                         "Paused enrollment due to reply",
                         enrollment_id=enrollment.id,

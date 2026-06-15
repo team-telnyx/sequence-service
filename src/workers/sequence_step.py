@@ -19,7 +19,12 @@ from src.models.models import (
 from src.services.email_builder import build_tracked_email
 from src.api.tracking import generate_unsubscribe_url
 from src.services.gmail import GmailService, GmailError
-from src.services.mailbox_rotation import select_mailbox, reserve_send, release_send
+from src.services.mailbox_rotation import (
+    select_mailbox,
+    reserve_send,
+    release_send,
+    seconds_until_capacity_reset,
+)
 from src.services.queue import queue_sequence_step
 from src.services.template import render_email
 from src.services.circuit_breaker import check_circuit_breaker
@@ -47,7 +52,7 @@ async def process_sequence_step(
 ) -> dict:
     """
     Process a single sequence step.
-    
+
     1. Load enrollment step with all related data
     2. Select or use assigned mailbox
     3. Render email content
@@ -55,7 +60,7 @@ async def process_sequence_step(
     5. Update status
     """
     logger.info("Processing sequence step", enrollment_step_id=enrollment_step_id)
-    
+
     async with async_session() as db:
         # Load enrollment step
         result = await db.execute(
@@ -69,15 +74,15 @@ async def process_sequence_step(
             )
         )
         enrollment_step = result.scalar_one_or_none()
-        
+
         if not enrollment_step:
             logger.error("Enrollment step not found", enrollment_step_id=enrollment_step_id)
             raise ValueError(f"Enrollment step not found: {enrollment_step_id}")
-        
+
         enrollment = enrollment_step.enrollment
         sequence = enrollment.sequence
         step = enrollment_step.step
-        
+
         # Check enrollment is still active
         if enrollment.status != EnrollmentStatus.ACTIVE:
             logger.info(
@@ -86,7 +91,7 @@ async def process_sequence_step(
                 status=enrollment.status,
             )
             return {"skipped": True, "reason": "enrollment_not_active"}
-        
+
         # Suppression check — never send to suppressed contacts
         is_suppressed = await check_suppressed(db, enrollment.contact_email, tenant_id)
         if is_suppressed:
@@ -99,7 +104,7 @@ async def process_sequence_step(
             enrollment_step.status = EnrollmentStepStatus.SKIPPED
             await db.commit()
             return {"skipped": True, "reason": "suppressed"}
-        
+
         # Circuit breaker check — skip if mailbox bounce rate is too high
         tripped = await check_circuit_breaker(db, enrollment.mailbox_id, tenant_id)
         if tripped:
@@ -109,7 +114,7 @@ async def process_sequence_step(
                 mailbox_id=enrollment.mailbox_id,
             )
             return {"skipped": True, "reason": "circuit_breaker"}
-        
+
         # Send window check — re-queue if outside recipient's business hours
         window_delay = check_send_window(enrollment.timezone)
         if window_delay is not None:
@@ -124,7 +129,7 @@ async def process_sequence_step(
                 delay_seconds=window_delay,
             )
             return {"skipped": True, "reason": "outside_send_window", "requeued_delay": window_delay}
-        
+
         # Check step is ready to process (PENDING or SCHEDULED)
         if enrollment_step.status not in (EnrollmentStepStatus.PENDING, EnrollmentStepStatus.SCHEDULED):
             logger.info(
@@ -160,24 +165,42 @@ async def process_sequence_step(
             select(Mailbox).where(Mailbox.id == enrollment.mailbox_id)
         )
         mailbox = result.scalar_one_or_none()
-        
+
         if not mailbox:
             logger.error("Enrollment mailbox not found", mailbox_id=enrollment.mailbox_id)
             raise RuntimeError(f"Enrollment mailbox not found: {enrollment.mailbox_id}")
-        
+
         # HARDCODED ENFORCEMENT: Verify mailbox is allowed for this tenant
         try:
             validate_mailbox_for_tenant(tenant_id, mailbox.email)
         except ValueError as e:
             logger.error("Mailbox not allowed for tenant", error=str(e))
             raise RuntimeError(str(e))
-        
-        # Reserve send slot
+
+        # Reserve send slot. reserve_send is the SOLE authoritative enforcer of the
+        # hard 75/day cap (atomic conditional UPDATE) and returns False when the
+        # sticky mailbox is at capacity. H3 (REVOPS-972): at-capacity must DEFER,
+        # not crash. Previously this raised RuntimeError, so arq retried 3x/30s and
+        # abandoned a hot follow-up pinned to a full mailbox. Instead we re-queue
+        # the SAME step to just after the next 00:05 UTC capacity reset (mirroring
+        # the send-window re-queue above) and return a deferred result. No
+        # SentEmail row is written and no slot is consumed, so the cap is untouched.
         reserved = await reserve_send(db, mailbox.id)
         if not reserved:
-            logger.warning("Failed to reserve send slot", mailbox_id=mailbox.id)
-            raise RuntimeError("Failed to reserve send slot - mailbox at capacity")
-        
+            defer_delay = seconds_until_capacity_reset()
+            logger.info(
+                "Mailbox at capacity — deferring to next daily reset",
+                enrollment_step_id=enrollment_step_id,
+                mailbox_id=mailbox.id,
+                delay_seconds=defer_delay,
+            )
+            await queue_sequence_step(
+                enrollment_step_id=enrollment_step_id,
+                tenant_id=tenant_id,
+                delay_seconds=defer_delay,
+            )
+            return {"deferred": True, "reason": "mailbox_at_capacity"}
+
         # Use Scout-composed content if available, otherwise render step template
         if enrollment_step.custom_subject and enrollment_step.custom_body:
             # Scout composed this email - use it directly
@@ -214,7 +237,7 @@ async def process_sequence_step(
 
         import uuid
         from datetime import datetime
-        
+
         # Create sent email record first (need ID for tracking)
         sent_email_id = str(uuid.uuid4())
         sent_email = SentEmail(
@@ -247,7 +270,7 @@ async def process_sequence_step(
             is_html=True,  # step.body is HTML
             enrollment_id=enrollment.id,
         )
-        
+
         # Build RFC 8058 List-Unsubscribe header. Advertise the one-click HTTPS
         # endpoint ONLY when it's reachable (one_click_unsubscribe_enabled);
         # otherwise mailto-only, so we never advertise a dead one-click URL
@@ -274,11 +297,11 @@ async def process_sequence_step(
                 )
                 gmail_message_id = result['message_id']
                 gmail_thread_id = result['thread_id']
-                
+
                 # Update sent email with actual IDs
                 sent_email.message_id = gmail_message_id
                 sent_email.thread_id = gmail_thread_id
-                
+
                 logger.info(
                     "Email sent via Gmail (HTML with tracking)",
                     from_email=mailbox.email,
@@ -313,22 +336,22 @@ async def process_sequence_step(
                 to_email=enrollment.contact_email,
                 subject=subject,
             )
-        
+
         # Update step status
         enrollment_step.status = EnrollmentStepStatus.SENT
         enrollment_step.sent_at = datetime.utcnow()
-        
+
         # Update enrollment current_step
         enrollment.current_step = step.step_number
-        
+
         await db.commit()
-        
+
         logger.info(
             "Sequence step processed successfully",
             enrollment_step_id=enrollment_step_id,
             message_id=sent_email.message_id,
         )
-        
+
         # Queue next step if exists
         next_step_info = await _queue_next_step(
             db=db,
@@ -336,7 +359,7 @@ async def process_sequence_step(
             current_step_number=step.step_number,
             tenant_id=tenant_id,
         )
-        
+
         return {
             "success": True,
             "message_id": sent_email.message_id,
@@ -353,11 +376,11 @@ async def _queue_next_step(
 ) -> dict | None:
     """
     Find and queue the next step in the sequence.
-    
+
     Returns info about queued step, or None if no next step.
     """
     from src.models.models import SequenceStep
-    
+
     # Find the next step in sequence
     result = await db.execute(
         select(SequenceStep)
@@ -369,7 +392,7 @@ async def _queue_next_step(
         .limit(1)
     )
     next_step = result.scalar_one_or_none()
-    
+
     if not next_step:
         logger.info(
             "No more steps in sequence",
@@ -380,7 +403,7 @@ async def _queue_next_step(
         enrollment.status = EnrollmentStatus.COMPLETED
         await db.commit()
         return None
-    
+
     # Find the enrollment step for the next sequence step
     result = await db.execute(
         select(SequenceEnrollmentStep)
@@ -390,7 +413,7 @@ async def _queue_next_step(
         )
     )
     next_enrollment_step = result.scalar_one_or_none()
-    
+
     if not next_enrollment_step:
         logger.error(
             "Enrollment step not found for next sequence step",
@@ -398,10 +421,10 @@ async def _queue_next_step(
             step_id=next_step.id,
         )
         return None
-    
+
     # Calculate delay in seconds (with optional jitter)
     delay_seconds = (next_step.delay_days * 24 * 3600) + (next_step.delay_hours * 3600)
-    
+
     if settings.send_jitter_enabled and settings.send_jitter_minutes > 0:
         jitter = random.randint(
             -settings.send_jitter_minutes * 60,
@@ -409,13 +432,13 @@ async def _queue_next_step(
         )
         delay_seconds = max(0, delay_seconds + jitter)
         logger.info("Applied send jitter", jitter_seconds=jitter, total_delay=delay_seconds)
-    
+
     # Mark as scheduled. Record scheduled_at so a lost arq job can be detected
     # and reconciled (audit M4) — previously this column was never written.
     next_enrollment_step.status = EnrollmentStepStatus.SCHEDULED
     next_enrollment_step.scheduled_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
     await db.commit()
-    
+
     # Queue the next step
     try:
         job_id = await queue_sequence_step(
@@ -423,7 +446,7 @@ async def _queue_next_step(
             tenant_id=tenant_id,
             delay_seconds=delay_seconds if delay_seconds > 0 else None,
         )
-        
+
         logger.info(
             "Queued next sequence step",
             enrollment_id=enrollment.id,
@@ -432,7 +455,7 @@ async def _queue_next_step(
             delay_seconds=delay_seconds,
             job_id=job_id,
         )
-        
+
         return {
             "enrollment_step_id": next_enrollment_step.id,
             "step_number": next_step.step_number,

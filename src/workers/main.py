@@ -7,6 +7,7 @@ import structlog
 
 from src.config import get_settings
 from src.workers.circuit_resume import resume_circuit_breaker_paused
+from src.workers.daily_reset import reset_daily_send_counts
 from src.workers.reconcile import reconcile_scheduled_steps
 from src.workers.sequence_step import process_sequence_step
 from src.workers.signal_detection import detect_signals, detect_signals_all_mailboxes
@@ -29,7 +30,7 @@ async def shutdown(ctx: dict) -> None:
 
 class WorkerSettings:
     """ARQ worker settings."""
-    
+
     functions = [
         process_sequence_step,
         detect_signals,
@@ -37,26 +38,34 @@ class WorkerSettings:
         deliver_webhook,
         reconcile_scheduled_steps,
         resume_circuit_breaker_paused,
+        reset_daily_send_counts,
     ]
 
     cron_jobs = [
         # Re-enqueue steps stranded in SCHEDULED by a lost arq job (M4). Every 10 min;
         # the >10 min grace window ensures it never races a step waiting on its defer.
-        cron(reconcile_scheduled_steps, minute=set(range(0, 60, 10)), run_at_startup=False),
+        cron(
+            reconcile_scheduled_steps,
+            minute=set(range(0, 60, 10)),
+            run_at_startup=False,
+        ),
         # Un-pause circuit_breaker-paused enrollments once the mailbox bounce rate
         # cools below the resume threshold. Every 30 min (offset from the reconciler).
         cron(resume_circuit_breaker_paused, minute={5, 35}, run_at_startup=False),
+        # Reset all mailbox sent_today counters at 00:05 UTC (REVOPS-1231).
+        # Without this, the daily cap accumulates and compose goes silent.
+        cron(reset_daily_send_counts, hour=0, minute=5, run_at_startup=False),
     ]
 
     on_startup = startup
     on_shutdown = shutdown
-    
+
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
-    
+
     # Queue settings
     max_jobs = settings.worker_concurrency
     job_timeout = 300  # 5 minutes
-    
+
     # Retry settings
     max_tries = 3
     retry_defer_time = 30  # Start with 30s delay
@@ -65,4 +74,5 @@ class WorkerSettings:
 if __name__ == "__main__":
     # Run worker directly
     from arq import run_worker
+
     run_worker(WorkerSettings)

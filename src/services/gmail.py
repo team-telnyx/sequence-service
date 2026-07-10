@@ -116,12 +116,13 @@ class GmailService:
         thread_id: Optional[str] = None,
         message_id: Optional[str] = None,
         cc: Optional[str] = None,
+        bcc: Optional[str] = None,
         reply_to: Optional[str] = None,
         sender_name: Optional[str] = None,
     ) -> dict:
         """
         Send a plain text email.
-        
+
         Args:
             to: Recipient email address
             subject: Email subject
@@ -129,9 +130,10 @@ class GmailService:
             thread_id: Gmail thread ID for threading (reply)
             message_id: Message-ID header to reply to
             cc: CC recipients (comma-separated)
+            bcc: BCC recipients (comma-separated)
             reply_to: Reply-To header
             sender_name: Display name for sender
-            
+
         Returns:
             dict with message_id, thread_id, label_ids
         """
@@ -141,6 +143,7 @@ class GmailService:
             body=body,
             is_html=False,
             cc=cc,
+            bcc=bcc,
             reply_to=reply_to,
             message_id=message_id,
             sender_name=sender_name,
@@ -156,6 +159,7 @@ class GmailService:
         thread_id: Optional[str] = None,
         message_id: Optional[str] = None,
         cc: Optional[str] = None,
+        bcc: Optional[str] = None,
         reply_to: Optional[str] = None,
         sender_name: Optional[str] = None,
         plain_text_fallback: Optional[str] = None,
@@ -169,6 +173,7 @@ class GmailService:
             body=html_body,
             is_html=True,
             cc=cc,
+            bcc=bcc,
             reply_to=reply_to,
             message_id=message_id,
             sender_name=sender_name,
@@ -186,6 +191,7 @@ class GmailService:
         body: str,
         is_html: bool = False,
         cc: Optional[str] = None,
+        bcc: Optional[str] = None,
         reply_to: Optional[str] = None,
         message_id: Optional[str] = None,
         sender_name: Optional[str] = None,
@@ -206,6 +212,10 @@ class GmailService:
 
         if cc:
             message['Cc'] = cc
+        # Bcc stays in the raw submission for Gmail to route the copy, but is
+        # stripped from the prospect's delivered headers (standard Bcc semantics).
+        if bcc:
+            message['Bcc'] = bcc
         if reply_to:
             message['Reply-To'] = reply_to
         if message_id:

@@ -294,6 +294,9 @@ async def process_sequence_step(
                     sender_name=mailbox.display_name,
                     list_unsubscribe=list_unsubscribe,
                     one_click=settings.one_click_unsubscribe_enabled,
+                    # Email-to-Salesforce: SFDC logs a completed Task on the
+                    # matching contact/lead from this BCC copy.
+                    bcc=settings.salesforce_bcc_address or None,
                 )
                 gmail_message_id = result['message_id']
                 gmail_thread_id = result['thread_id']

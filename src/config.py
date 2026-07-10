@@ -82,6 +82,17 @@ class Settings(BaseSettings):
     # mailto unsubscribe is used instead.
     one_click_unsubscribe_enabled: bool = False
 
+    # Email-to-Salesforce task logging (Kevin 2026-07-10): every outbound send is
+    # BCC'd here so SFDC auto-logs a completed Task on the matching contact/lead,
+    # replacing the manual post-send task entry. Blank disables the BCC. NOTE:
+    # SFDC only accepts these if the SENDING address (quinn.c–j@telnyx.com) is in
+    # the owning user's "My Acceptable Email Addresses" in Email-to-Salesforce
+    # setup — otherwise messages are silently discarded.
+    salesforce_bcc_address: str = (
+        "emailtosalesforce@a-33gccorss1hb49mgd2oqu29yotdtrci512h16g9oae45z3evgp"
+        ".j-1nifjeaq.usa416.le.salesforce.com"
+    )
+
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000

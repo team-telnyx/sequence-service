@@ -129,6 +129,11 @@ class Settings(BaseSettings):
     send_jitter_enabled: bool = True
     send_jitter_minutes: int = 15
 
+    # Min spacing between consecutive catch-up touches (REVOPS-1376). When a
+    # step's absolute target is already in the past, schedule it min_gap from
+    # now instead of firing immediately (prevents back-to-back catch-up sends).
+    min_step_gap_hours: int = 24
+
     # Logging
     log_level: str = "INFO"
 

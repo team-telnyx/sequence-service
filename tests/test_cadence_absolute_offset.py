@@ -218,3 +218,115 @@ async def test_process_sequence_step_schedules_step2_from_enrollment_created_at(
         abs((step2.scheduled_at - old_bug_expected).total_seconds())
         > timedelta(hours=23).total_seconds()
     )
+
+
+# -- 4. REVOPS-1376 min-gap catch-up spacing (Part 2A) -----------------------
+
+
+def test_compute_next_scheduled_at_min_gap_off_zero_returns_now():
+    """min_gap_seconds=0 reproduces Part D's past-due behavior (== now)."""
+    T0 = datetime(2026, 1, 1, 12, 0, 0)
+    now = T0 + timedelta(days=15)  # target = T0 + 9d, past-due
+    result = ss.compute_next_scheduled_at(
+        created_at=T0,
+        delay_days=9,
+        delay_hours=0,
+        now=now,
+        jitter_seconds=0,
+        min_gap_seconds=0,
+    )
+    assert result == now
+
+
+def test_compute_next_scheduled_at_min_gap_on_past_due_returns_now_plus_gap():
+    """min_gap on: past-due step schedules at now + min_gap (jitter=0)."""
+    T0 = datetime(2026, 1, 1, 12, 0, 0)
+    now = T0 + timedelta(days=15)  # target = T0 + 9d, past-due
+    min_gap = 3600  # 1h
+    result = ss.compute_next_scheduled_at(
+        created_at=T0,
+        delay_days=9,
+        delay_hours=0,
+        now=now,
+        jitter_seconds=0,
+        min_gap_seconds=min_gap,
+    )
+    assert result == now + timedelta(seconds=min_gap)
+
+
+def test_compute_next_scheduled_at_min_gap_on_jitter_within_bounds():
+    """min_gap + jitter: result within +/-jitter of now + min_gap (past-due)."""
+    T0 = datetime(2026, 1, 1, 12, 0, 0)
+    now = T0 + timedelta(days=15)
+    min_gap = 3600
+    target = now + timedelta(seconds=min_gap)
+    for jitter in (-900, -300, 0, 300, 900):
+        result = ss.compute_next_scheduled_at(
+            created_at=T0,
+            delay_days=9,
+            delay_hours=0,
+            now=now,
+            jitter_seconds=jitter,
+            min_gap_seconds=min_gap,
+        )
+        assert abs((result - target).total_seconds()) <= 900
+
+
+def test_compute_next_scheduled_at_consecutive_catch_up_min_gap_apart():
+    """Two consecutive catch-up advances are exactly min_gap apart (jitter=0).
+
+    Step A past-due (delay_days=9, now=T0+15d) -> now1 + min_gap.
+    Step B past-due (delay_days=15, now=now1+min_gap) -> (now1+min_gap) + min_gap.
+    The two scheduled_at values differ by exactly min_gap_seconds.
+    """
+    T0 = datetime(2026, 1, 1, 12, 0, 0)
+    min_gap = 86400  # 1d
+    now1 = T0 + timedelta(days=15)  # step A: target T0+9d, past-due
+    a = ss.compute_next_scheduled_at(
+        created_at=T0,
+        delay_days=9,
+        delay_hours=0,
+        now=now1,
+        jitter_seconds=0,
+        min_gap_seconds=min_gap,
+    )
+    now2 = a  # step B's "now" is step A's scheduled_at (consecutive advance)
+    b = ss.compute_next_scheduled_at(
+        created_at=T0,
+        delay_days=15,
+        delay_hours=0,
+        now=now2,
+        jitter_seconds=0,
+        min_gap_seconds=min_gap,
+    )
+    assert (b - a).total_seconds() == min_gap
+
+
+def test_compute_next_scheduled_at_negative_jitter_past_due_ge_now():
+    """Negative jitter + past-due + min_gap: result >= now (never before)."""
+    T0 = datetime(2026, 1, 1, 12, 0, 0)
+    now = T0 + timedelta(days=15)
+    result = ss.compute_next_scheduled_at(
+        created_at=T0,
+        delay_days=9,
+        delay_hours=0,
+        now=now,
+        jitter_seconds=-900,
+        min_gap_seconds=3600,
+    )
+    assert result >= now
+
+
+def test_compute_next_scheduled_at_on_cadence_unaffected_by_min_gap():
+    """On-cadence step (target > now): min_gap not applied, still == target."""
+    T0 = datetime(2026, 1, 1, 12, 0, 0)
+    now = T0 + timedelta(hours=1)  # target T0+4d is in the future
+    result = ss.compute_next_scheduled_at(
+        created_at=T0,
+        delay_days=4,
+        delay_hours=0,
+        now=now,
+        jitter_seconds=0,
+        min_gap_seconds=86400,  # 1d, must be ignored since target is future
+    )
+    assert result == T0 + timedelta(days=4)

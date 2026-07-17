@@ -46,24 +46,35 @@ def _blank_content(subject, body) -> bool:
 
 
 def compute_next_scheduled_at(
-    created_at, delay_days, delay_hours, now, jitter_seconds=0
+    created_at,
+    delay_days,
+    delay_hours,
+    now,
+    jitter_seconds=0,
+    min_gap_seconds=0,
 ):
     """Absolute-offset scheduling: enrollment.created_at + delay, with a
-    past-due guard.
+    past-due guard and catch-up min-spacing.
 
     Scout authors ``delay_days`` as ABSOLUTE day-offsets from enrollment
     (Old-ICP 0,4,9,15,22), not incremental waits from the previous send.
     Anchoring on ``created_at`` keeps the cadence constant regardless of when
-    prior steps ran. The ``max(target, now)`` guard prevents scheduling in the
-    past when a prior step ran late (a late step 1 must not push step 2's send
-    into the past). Jitter is applied after the guard so the anchor itself is
-    never before ``now``.
+    prior steps ran. When the absolute target is already in the past (a prior
+    step ran late), the step is scheduled ``min_gap_seconds`` from ``now``
+    instead of firing immediately, so a behind-schedule enrollment cannot burn
+    through remaining touches back-to-back (REVOPS-1376). Jitter is applied
+    after the guard and a final ``max(result, now)`` clamp guarantees negative
+    jitter never lands before ``now``.
 
-    REVOPS-1375.
+    REVOPS-1375 / REVOPS-1376.
     """
     target = created_at + timedelta(days=delay_days, hours=delay_hours)
-    scheduled = max(target, now)
-    return scheduled + timedelta(seconds=jitter_seconds)
+    if target < now:
+        scheduled = now + timedelta(seconds=min_gap_seconds)
+    else:
+        scheduled = target
+    result = scheduled + timedelta(seconds=jitter_seconds)
+    return max(result, now)
 
 
 async def process_sequence_step(
@@ -473,6 +484,11 @@ async def _queue_next_step(
     # step re-anchored on the prior send time. The past-due guard inside
     # compute_next_scheduled_at (max(target, now)) prevents scheduling in the
     # past when a prior step ran late.
+    # REVOPS-1376: a past-due step is scheduled min_gap from now (not now) so
+    # a behind-schedule enrollment cannot fire back-to-back catch-up touches.
+    # One captured `now` is reused for both the helper anchor and the arq delay
+    # so a wall-clock tick between them cannot shift the delay (review #3).
+    now = datetime.utcnow()
     jitter_seconds = 0
     if settings.send_jitter_enabled and settings.send_jitter_minutes > 0:
         jitter_seconds = random.randint(
@@ -481,6 +497,17 @@ async def _queue_next_step(
         )
         logger.info("Applied send jitter", jitter_seconds=jitter_seconds)
 
+    # Apply the catch-up min-gap only to GENUINELY past-due steps (>1m past).
+    # A step whose absolute target is within 1 minute of now (e.g. delay_days=0
+    # on a just-created enrollment) is "due now", not catch-up — the min-gap
+    # guard is for enrollments that fell genuinely behind (REVOPS-1376).
+    target = enrollment.created_at + timedelta(
+        days=next_step.delay_days, hours=next_step.delay_hours
+    )
+    min_gap_seconds = (
+        settings.min_step_gap_hours * 3600 if target < now - timedelta(minutes=1) else 0
+    )
+
     # Mark as scheduled. Record scheduled_at so a lost arq job can be detected
     # and reconciled (audit M4) — previously this column was never written.
     next_enrollment_step.status = EnrollmentStepStatus.SCHEDULED
@@ -488,17 +515,18 @@ async def _queue_next_step(
         enrollment.created_at,
         next_step.delay_days,
         next_step.delay_hours,
-        datetime.utcnow(),
+        now,
         jitter_seconds,
+        min_gap_seconds,
     )
     await db.commit()
 
     # Queue the next step. The arq delay is computed from the NEW scheduled_at
     # (absolute time), not the raw step delay, so the job fires at the right
     # moment even when a prior step ran late (past-due guard pushed
-    # scheduled_at forward to now).
+    # scheduled_at forward to now + min_gap).
     delay_seconds = int(
-        max(0, (next_enrollment_step.scheduled_at - datetime.utcnow()).total_seconds())
+        max(0, (next_enrollment_step.scheduled_at - now).total_seconds())
     )
     try:
         job_id = await queue_sequence_step(

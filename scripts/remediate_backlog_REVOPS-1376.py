@@ -131,12 +131,12 @@ def _rebaseline_counts(cur):
               JOIN sequence_enrollments enr ON enr.id = es.enrollment_id
              WHERE enr.status = 'ACTIVE'
                AND enr.created_at >= now() - make_interval(days => {CULL_AGE_DAYS})
-               AND es.status = 'SCHEDULED'
-               AND (
-                   es.scheduled_at IS NULL
-                   OR abs(extract(epoch from (es.scheduled_at - ({INTENDED}))))
-                       > {REBASELINE_TOLERANCE_SECONDS}
-               )
+                AND es.status = 'SCHEDULED'
+                AND (
+                    es.scheduled_at IS NULL
+                    OR (({INTENDED}) >= now() AND abs(extract(epoch from (es.scheduled_at - ({INTENDED})))) > {REBASELINE_TOLERANCE_SECONDS})
+                    OR (({INTENDED}) <  now() AND es.scheduled_at < now())
+                )
         )
         SELECT
             count(*)                                                          AS total,
@@ -209,7 +209,7 @@ def apply(cur):
     cur.execute(
         f"""
         UPDATE sequence_enrollment_steps es
-           SET status = 'SKIPPED'
+            SET status = 'SKIPPED', updated_at = now()
           FROM sequence_enrollments enr
          WHERE enr.id = es.enrollment_id
            AND enr.status = 'ACTIVE'
@@ -222,7 +222,7 @@ def apply(cur):
     cur.execute(
         f"""
         UPDATE sequence_enrollments
-           SET status = 'PAUSED', pause_reason = 'manual'
+            SET status = 'PAUSED', pause_reason = 'manual', updated_at = now()
          WHERE status = 'ACTIVE'
            AND created_at < now() - make_interval(days => {CULL_AGE_DAYS})
         """
@@ -235,21 +235,21 @@ def apply(cur):
     cur.execute(
         f"""
         UPDATE sequence_enrollment_steps es
-           SET scheduled_at = CASE
-               WHEN ({INTENDED}) < now()
-               THEN now() + make_interval(hours => %s)
-               ELSE ({INTENDED})
-           END
-          FROM sequence_steps ss, sequence_enrollments enr
-         WHERE ss.id = es.step_id AND enr.id = es.enrollment_id
-           AND enr.status = 'ACTIVE'
-           AND enr.created_at >= now() - make_interval(days => {CULL_AGE_DAYS})
-           AND es.status = 'SCHEDULED'
-           AND (
-               es.scheduled_at IS NULL
-               OR abs(extract(epoch from (es.scheduled_at - ({INTENDED}))))
-                   > {REBASELINE_TOLERANCE_SECONDS}
-           )
+            SET scheduled_at = CASE
+                WHEN ({INTENDED}) < now()
+                THEN now() + make_interval(hours => %s) + (random() * interval '1 hour')
+                ELSE ({INTENDED})
+            END, updated_at = now()
+           FROM sequence_steps ss, sequence_enrollments enr
+          WHERE ss.id = es.step_id AND enr.id = es.enrollment_id
+            AND enr.status = 'ACTIVE'
+            AND enr.created_at >= now() - make_interval(days => {CULL_AGE_DAYS})
+            AND es.status = 'SCHEDULED'
+            AND (
+                es.scheduled_at IS NULL
+                OR (({INTENDED}) >= now() AND abs(extract(epoch from (es.scheduled_at - ({INTENDED})))) > {REBASELINE_TOLERANCE_SECONDS})
+                OR (({INTENDED}) <  now() AND es.scheduled_at < now())
+            )
         """,
         (min_gap_hours,),
     )
@@ -271,6 +271,17 @@ def main():
 
     conn = psycopg2.connect(_sync_dsn())
     conn.autocommit = False
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database()")
+        dbname = cur.fetchone()[0]
+        if dbname != "sequence_service":
+            conn.close()
+            sys.exit(
+                f"ABORT: connected to '{dbname}', expected 'sequence_service'. "
+                f"Set DATABASE_URL=postgresql+asyncpg://<user>@localhost:5432/sequence_service "
+                f"(the repo .env points at the scout DB)."
+            )
+        print(f"Target DB: {dbname}")
     try:
         with conn.cursor() as cur:
             if args.apply:

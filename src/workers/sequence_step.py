@@ -45,6 +45,27 @@ def _blank_content(subject, body) -> bool:
     return not (subject or "").strip() or not (body or "").strip()
 
 
+def compute_next_scheduled_at(
+    created_at, delay_days, delay_hours, now, jitter_seconds=0
+):
+    """Absolute-offset scheduling: enrollment.created_at + delay, with a
+    past-due guard.
+
+    Scout authors ``delay_days`` as ABSOLUTE day-offsets from enrollment
+    (Old-ICP 0,4,9,15,22), not incremental waits from the previous send.
+    Anchoring on ``created_at`` keeps the cadence constant regardless of when
+    prior steps ran. The ``max(target, now)`` guard prevents scheduling in the
+    past when a prior step ran late (a late step 1 must not push step 2's send
+    into the past). Jitter is applied after the guard so the anchor itself is
+    never before ``now``.
+
+    REVOPS-1375.
+    """
+    target = created_at + timedelta(days=delay_days, hours=delay_hours)
+    scheduled = max(target, now)
+    return scheduled + timedelta(seconds=jitter_seconds)
+
+
 async def process_sequence_step(
     ctx: dict,
     enrollment_step_id: str,
@@ -67,8 +88,9 @@ async def process_sequence_step(
             select(SequenceEnrollmentStep)
             .where(SequenceEnrollmentStep.id == enrollment_step_id)
             .options(
-                selectinload(SequenceEnrollmentStep.enrollment)
-                .selectinload(SequenceEnrollment.sequence),
+                selectinload(SequenceEnrollmentStep.enrollment).selectinload(
+                    SequenceEnrollment.sequence
+                ),
                 selectinload(SequenceEnrollmentStep.step),
                 selectinload(SequenceEnrollmentStep.mailbox),
             )
@@ -76,7 +98,9 @@ async def process_sequence_step(
         enrollment_step = result.scalar_one_or_none()
 
         if not enrollment_step:
-            logger.error("Enrollment step not found", enrollment_step_id=enrollment_step_id)
+            logger.error(
+                "Enrollment step not found", enrollment_step_id=enrollment_step_id
+            )
             raise ValueError(f"Enrollment step not found: {enrollment_step_id}")
 
         enrollment = enrollment_step.enrollment
@@ -128,10 +152,17 @@ async def process_sequence_step(
                 tenant_id=tenant_id,
                 delay_seconds=window_delay,
             )
-            return {"skipped": True, "reason": "outside_send_window", "requeued_delay": window_delay}
+            return {
+                "skipped": True,
+                "reason": "outside_send_window",
+                "requeued_delay": window_delay,
+            }
 
         # Check step is ready to process (PENDING or SCHEDULED)
-        if enrollment_step.status not in (EnrollmentStepStatus.PENDING, EnrollmentStepStatus.SCHEDULED):
+        if enrollment_step.status not in (
+            EnrollmentStepStatus.PENDING,
+            EnrollmentStepStatus.SCHEDULED,
+        ):
             logger.info(
                 "Skipping - step not ready",
                 enrollment_step_id=enrollment_step_id,
@@ -146,7 +177,9 @@ async def process_sequence_step(
         # to a prospect is worse than a rare missed follow-up. A *known* GmailError
         # removes its marker (see below), so only a hard crash mid-send leaves one.
         existing_send = await db.execute(
-            select(SentEmail.id).where(SentEmail.enrollment_step_id == enrollment_step.id).limit(1)
+            select(SentEmail.id)
+            .where(SentEmail.enrollment_step_id == enrollment_step.id)
+            .limit(1)
         )
         if existing_send.scalar_one_or_none() is not None:
             logger.warning(
@@ -161,13 +194,16 @@ async def process_sequence_step(
         # Use enrollment's sticky mailbox (assigned at enrollment time)
         from src.models.models import Mailbox
         from src.config import validate_mailbox_for_tenant
+
         result = await db.execute(
             select(Mailbox).where(Mailbox.id == enrollment.mailbox_id)
         )
         mailbox = result.scalar_one_or_none()
 
         if not mailbox:
-            logger.error("Enrollment mailbox not found", mailbox_id=enrollment.mailbox_id)
+            logger.error(
+                "Enrollment mailbox not found", mailbox_id=enrollment.mailbox_id
+            )
             raise RuntimeError(f"Enrollment mailbox not found: {enrollment.mailbox_id}")
 
         # HARDCODED ENFORCEMENT: Verify mailbox is allowed for this tenant
@@ -206,7 +242,9 @@ async def process_sequence_step(
             # Scout composed this email - use it directly
             subject = enrollment_step.custom_subject
             body = enrollment_step.custom_body
-            logger.info("Using Scout-composed content", enrollment_step_id=enrollment_step_id)
+            logger.info(
+                "Using Scout-composed content", enrollment_step_id=enrollment_step_id
+            )
         else:
             # Fall back to step template
             subject, body = render_email(
@@ -229,7 +267,9 @@ async def process_sequence_step(
                 enrollment_step_id=enrollment_step_id,
                 enrollment_id=enrollment.id,
                 to_email=enrollment.contact_email,
-                has_custom=bool(enrollment_step.custom_subject and enrollment_step.custom_body),
+                has_custom=bool(
+                    enrollment_step.custom_subject and enrollment_step.custom_body
+                ),
             )
             enrollment_step.status = EnrollmentStepStatus.SKIPPED
             await db.commit()
@@ -277,7 +317,9 @@ async def process_sequence_step(
         # (track.telnyx.com is NXDOMAIN — Wave 0 interim).
         mailto_unsub = "<mailto:unsubscribe@telnyx.com?subject=unsubscribe>"
         if settings.one_click_unsubscribe_enabled:
-            unsub_url = generate_unsubscribe_url(settings.tracking_base_url, enrollment.id)
+            unsub_url = generate_unsubscribe_url(
+                settings.tracking_base_url, enrollment.id
+            )
             list_unsubscribe = f"<{unsub_url}>, {mailto_unsub}"
         else:
             list_unsubscribe = mailto_unsub
@@ -298,8 +340,8 @@ async def process_sequence_step(
                     # matching contact/lead from this BCC copy.
                     bcc=settings.salesforce_bcc_address or None,
                 )
-                gmail_message_id = result['message_id']
-                gmail_thread_id = result['thread_id']
+                gmail_message_id = result["message_id"]
+                gmail_thread_id = result["thread_id"]
 
                 # Update sent email with actual IDs
                 sent_email.message_id = gmail_message_id
@@ -409,8 +451,7 @@ async def _queue_next_step(
 
     # Find the enrollment step for the next sequence step
     result = await db.execute(
-        select(SequenceEnrollmentStep)
-        .where(
+        select(SequenceEnrollmentStep).where(
             SequenceEnrollmentStep.enrollment_id == enrollment.id,
             SequenceEnrollmentStep.step_id == next_step.id,
         )
@@ -425,24 +466,40 @@ async def _queue_next_step(
         )
         return None
 
-    # Calculate delay in seconds (with optional jitter)
-    delay_seconds = (next_step.delay_days * 24 * 3600) + (next_step.delay_hours * 3600)
-
+    # REVOPS-1375: schedule ABSOLUTE-from-enrollment (created_at + delay), not
+    # incremental-from-previous-send (utcnow + delay). Scout authors delay_days
+    # as absolute day-offsets from enrollment (Old-ICP 0,4,9,15,22); the old
+    # incremental anchor stretched a 22-day sequence to ~50 days because each
+    # step re-anchored on the prior send time. The past-due guard inside
+    # compute_next_scheduled_at (max(target, now)) prevents scheduling in the
+    # past when a prior step ran late.
+    jitter_seconds = 0
     if settings.send_jitter_enabled and settings.send_jitter_minutes > 0:
-        jitter = random.randint(
+        jitter_seconds = random.randint(
             -settings.send_jitter_minutes * 60,
             settings.send_jitter_minutes * 60,
         )
-        delay_seconds = max(0, delay_seconds + jitter)
-        logger.info("Applied send jitter", jitter_seconds=jitter, total_delay=delay_seconds)
+        logger.info("Applied send jitter", jitter_seconds=jitter_seconds)
 
     # Mark as scheduled. Record scheduled_at so a lost arq job can be detected
     # and reconciled (audit M4) — previously this column was never written.
     next_enrollment_step.status = EnrollmentStepStatus.SCHEDULED
-    next_enrollment_step.scheduled_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
+    next_enrollment_step.scheduled_at = compute_next_scheduled_at(
+        enrollment.created_at,
+        next_step.delay_days,
+        next_step.delay_hours,
+        datetime.utcnow(),
+        jitter_seconds,
+    )
     await db.commit()
 
-    # Queue the next step
+    # Queue the next step. The arq delay is computed from the NEW scheduled_at
+    # (absolute time), not the raw step delay, so the job fires at the right
+    # moment even when a prior step ran late (past-due guard pushed
+    # scheduled_at forward to now).
+    delay_seconds = int(
+        max(0, (next_enrollment_step.scheduled_at - datetime.utcnow()).total_seconds())
+    )
     try:
         job_id = await queue_sequence_step(
             enrollment_step_id=next_enrollment_step.id,

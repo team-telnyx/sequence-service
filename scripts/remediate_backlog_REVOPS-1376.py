@@ -135,7 +135,10 @@ def _rebaseline_counts(cur):
                 AND (
                     es.scheduled_at IS NULL
                     OR (({INTENDED}) >= now() AND abs(extract(epoch from (es.scheduled_at - ({INTENDED})))) > {REBASELINE_TOLERANCE_SECONDS})
-                    OR (({INTENDED}) <  now() AND es.scheduled_at < now())
+                    OR (({INTENDED}) <  now() AND (
+                           es.scheduled_at < now()
+                        OR es.scheduled_at > now() + make_interval(hours => %(gap)s) + interval '2 hours'
+                    ))
                 )
         )
         SELECT
@@ -144,6 +147,7 @@ def _rebaseline_counts(cur):
             count(*) FILTER (WHERE intended >= now())                       AS on_cadence
         FROM candidates
         """,
+        {"gap": min_gap_hours},
     )
     total, past_due, on_cadence = cur.fetchone()
     return total, past_due, on_cadence, min_gap_hours
@@ -237,7 +241,7 @@ def apply(cur):
         UPDATE sequence_enrollment_steps es
             SET scheduled_at = CASE
                 WHEN ({INTENDED}) < now()
-                THEN now() + make_interval(hours => %s) + (random() * interval '1 hour')
+                THEN now() + make_interval(hours => %(gap)s) + (random() * interval '1 hour')
                 ELSE ({INTENDED})
             END, updated_at = now()
            FROM sequence_steps ss, sequence_enrollments enr
@@ -248,10 +252,13 @@ def apply(cur):
             AND (
                 es.scheduled_at IS NULL
                 OR (({INTENDED}) >= now() AND abs(extract(epoch from (es.scheduled_at - ({INTENDED})))) > {REBASELINE_TOLERANCE_SECONDS})
-                OR (({INTENDED}) <  now() AND es.scheduled_at < now())
+                OR (({INTENDED}) <  now() AND (
+                       es.scheduled_at < now()
+                    OR es.scheduled_at > now() + make_interval(hours => %(gap)s) + interval '2 hours'
+                ))
             )
         """,
-        (min_gap_hours,),
+        {"gap": min_gap_hours},
     )
     rebaselined = cur.rowcount
 

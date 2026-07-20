@@ -118,6 +118,16 @@ class Settings(BaseSettings):
     # in behind in-flight work instead of consuming the shared send cap.
     reconcile_per_mailbox_per_run: int = 10
     reconcile_new_send_reserve_fraction: float = 0.30
+    # The daily usable allowance is spread across this many hours so the
+    # reconciler trickles catch-up across the whole send window instead of
+    # emitting the full per-mailbox daily allowance in the first hour. Matches
+    # send_window_start=8 -> send_window_end=17 (REVOPS-1378 / 2026-07-20 review
+    # blocker 2: floor alone bounds the daily total, not the hourly rate).
+    reconcile_pacing_window_hours: int = 9
+    # MUST match the cron cadence in src/workers/main.py (minute=set(range(0,60,10))
+    # -> every 10 min). The two change together; if the cron is retuned this must
+    # track it or the allowance math mis-spreads the daily budget.
+    reconcile_sweep_minutes: int = 10
 
     # Circuit Breaker
     circuit_breaker_enabled: bool = True

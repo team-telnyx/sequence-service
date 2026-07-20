@@ -27,6 +27,19 @@ reconciliation per sweep, and reserve a fraction of daily_send_limit that the
 reconciler may never touch, so catch-up trickles in behind in-flight work instead
 of crowding it out of the shared send cap. Grouping is by enrollment.mailbox_id
 (step.mailbox_id is NULL on all SCHEDULED rows — assigned at send time).
+
+Two blocker fixes from the PR #23 planner review (2026-07-20):
+- Selection uses ROW_NUMBER() OVER (PARTITION BY enrollment.mailbox_id ORDER BY
+  scheduled_at ASC) so a correlated clump on one mailbox cannot fill the entire
+  batch and starve every other mailbox (a global ORDER BY ... LIMIT taken before
+  bucketing does exactly that — the original implementation).
+- The per-mailbox limit spreads the daily `usable` allowance across the send
+  window's sweeps (`allowance = ceil(usable / sweeps_left)`), bounding the *hourly
+  rate*, not just the daily total. Without it `per_run(10) × 6 sweeps/hr × 4
+  mailboxes ≈ 208 sends in hour one` — a 17% reduction on the 251 incident, not a
+  fix. The feedback lag (sent_today increments at send time while pacing decides
+  at enqueue time) makes the spread essential: several sweeps fire before the
+  counter reflects any of them.
 """
 
 import math
@@ -54,26 +67,79 @@ logger = structlog.get_logger()
 async def reconcile_scheduled_steps(ctx: dict) -> dict:
     """Re-enqueue stuck SCHEDULED steps with per-mailbox capacity pacing.
 
-    Returns {"reconciled": n, "scanned": m, "skipped_at_capacity": k,
-    "skipped_reserve_floor": j, "past_due_backlog_depth": d, "per_mailbox": {...}}.
+    Returns {"reconciled": n, "scanned": m, "past_due_backlog_depth": d,
+    "skipped_at_capacity": k, "skipped_reserve_floor": j,
+    "skipped_mailbox_missing": p, "skipped_no_mailbox": q,
+    "per_mailbox": {mailbox_id: {reconciled, pending, spare, ...}}}.
     """
     grace = timedelta(seconds=getattr(settings, "reconcile_grace_seconds", 600))
     batch_limit = getattr(settings, "reconcile_batch_limit", 100)
     per_mailbox_per_run = getattr(settings, "reconcile_per_mailbox_per_run", 10)
     reserve_fraction = getattr(settings, "reconcile_new_send_reserve_fraction", 0.30)
+    pacing_window_hours = getattr(settings, "reconcile_pacing_window_hours", 9)
+    sweep_minutes = getattr(settings, "reconcile_sweep_minutes", 10)
     now = datetime.utcnow()
     cutoff = now - grace
+
+    sweeps_left = max(1, math.ceil(pacing_window_hours * 60 / sweep_minutes))
+
     reconciled = 0
     skipped_at_capacity = 0
     skipped_reserve_floor = 0
-    per_mailbox_out: dict[str, dict] = {}
+    skipped_mailbox_missing = 0
+    skipped_no_mailbox = 0
+    per_mailbox_out: dict = {}
 
     async with async_session() as db:
-        result = await db.execute(
+        # Per-mailbox pending depth over the past-due predicate. One GROUP BY
+        # query supplies both the per-mailbox `pending` observability field AND
+        # the global `past_due_backlog_depth` (sum of the per-mailbox counts),
+        # replacing the separate global count.
+        pending_rows = (
+            await db.execute(
+                select(
+                    SequenceEnrollment.mailbox_id.label("mid"),
+                    func.count(SequenceEnrollmentStep.id).label("pending"),
+                )
+                .join(
+                    SequenceEnrollment,
+                    SequenceEnrollment.id == SequenceEnrollmentStep.enrollment_id,
+                )
+                .where(
+                    SequenceEnrollmentStep.status == EnrollmentStepStatus.SCHEDULED,
+                    # NULL < cutoff is NULL/false — a NULL scheduled_at is NOT
+                    # selected. A future `OR scheduled_at IS NULL` here would
+                    # re-fire follow-ups whose arq job is legitimately pending.
+                    SequenceEnrollmentStep.scheduled_at < cutoff,
+                )
+                .group_by(SequenceEnrollment.mailbox_id)
+            )
+        ).all()
+        pending_by_mailbox: dict = {row.mid: row.pending for row in pending_rows}
+        backlog_depth = sum(pending_by_mailbox.values())
+
+        # Selection: ROW_NUMBER() OVER (PARTITION BY enrollment.mailbox_id ORDER BY
+        # scheduled_at ASC) bounds the fetch to per_mailbox_per_run × n_mailboxes
+        # and guarantees every mailbox is represented. A global
+        # ORDER BY scheduled_at LIMIT batch_limit taken *before* bucketing lets
+        # one mailbox with the oldest past-due clump fill the entire batch and
+        # starve every other mailbox indefinitely (BLOCKER 1 from the PR #23
+        # review). batch_limit is an outer safety bound applied AFTER partitioning.
+        rn = (
+            func.row_number()
+            .over(
+                partition_by=SequenceEnrollment.mailbox_id,
+                order_by=SequenceEnrollmentStep.scheduled_at.asc(),
+            )
+            .label("rn")
+        )
+        subq = (
             select(
-                SequenceEnrollmentStep,
-                Sequence.tenant_id,
+                SequenceEnrollmentStep.id.label("step_id"),
+                SequenceEnrollmentStep.scheduled_at.label("scheduled_at"),
+                Sequence.tenant_id.label("tenant_id"),
                 SequenceEnrollment.mailbox_id.label("enrollment_mailbox_id"),
+                rn,
             )
             .join(
                 SequenceEnrollment,
@@ -82,56 +148,87 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
             .join(Sequence, Sequence.id == SequenceEnrollment.sequence_id)
             .where(
                 SequenceEnrollmentStep.status == EnrollmentStepStatus.SCHEDULED,
+                # NULL < cutoff is NULL/false — see comment on pending query.
                 SequenceEnrollmentStep.scheduled_at < cutoff,
             )
-            .order_by(SequenceEnrollmentStep.scheduled_at.asc())
+        ).subquery()
+        stmt = (
+            select(
+                subq.c.step_id,
+                subq.c.scheduled_at,
+                subq.c.tenant_id,
+                subq.c.enrollment_mailbox_id,
+            )
+            .where(subq.c.rn <= per_mailbox_per_run)
+            .order_by(subq.c.enrollment_mailbox_id, subq.c.scheduled_at)
             .limit(batch_limit)
         )
-        rows = result.all()
-
-        # Past-due backlog depth: total past-due SCHEDULED, uncapped (not just
-        # this batch). Must be visibly trending down day over day; flat-or-rising
-        # means arrivals exceed drain and needs escalation.
-        backlog_depth = (
-            await db.execute(
-                select(func.count(SequenceEnrollmentStep.id)).where(
-                    SequenceEnrollmentStep.status == EnrollmentStepStatus.SCHEDULED,
-                    SequenceEnrollmentStep.scheduled_at < cutoff,
-                )
-            )
-        ).scalar_one()
+        rows = (await db.execute(stmt)).all()
 
         # Bucket by enrollment.mailbox_id (NOT step.mailbox_id — NULL on all
-        # SCHEDULED rows, assigned at send time). Ordered ASC by scheduled_at
-        # above, so each bucket is already FIFO.
-        buckets: dict[str, list] = defaultdict(list)
-        for step, tenant_id, enrollment_mailbox_id in rows:
-            buckets[enrollment_mailbox_id].append((step, tenant_id))
+        # SCHEDULED rows, assigned at send time). The subquery already ordered
+        # by (enrollment_mailbox_id, scheduled_at), so each bucket is FIFO.
+        buckets: dict = defaultdict(list)
+        for row in rows:
+            buckets[row.enrollment_mailbox_id].append(row)
 
-        # Per-mailbox capacity limiting — mirrors circuit_resume.py:124-138 with
-        # an added reserve floor the reconciler may never consume.
+        # Fetch all referenced mailboxes in one query (avoids per-bucket N+1).
+        mailbox_ids = [mid for mid in buckets if mid is not None]
+        mailboxes: dict = {}
+        if mailbox_ids:
+            mbx_rows = (
+                (await db.execute(select(Mailbox).where(Mailbox.id.in_(mailbox_ids))))
+                .scalars()
+                .all()
+            )
+            mailboxes = {m.id: m for m in mbx_rows}
+
         for mailbox_id, items in buckets.items():
+            pending = pending_by_mailbox.get(mailbox_id, 0)
+
             if mailbox_id is None:
                 # Defensive: enrollment.mailbox_id is NOT NULL in the live schema
-                # (sticky sender assigned at enrollment), but guard against a
-                # legacy row so the sweep never silently drops steps.
-                per_mailbox_out[str(mailbox_id)] = {
+                # (sticky sender assigned at enrollment), but a legacy row could
+                # slip through. Increment a counter so the drop is observable,
+                # never silent.
+                skipped_no_mailbox += len(items)
+                per_mailbox_out[mailbox_id] = {
                     "reconciled": 0,
-                    "spare": None,
+                    "pending": pending,
                     "reason": "null_enrollment_mailbox",
                 }
+                logger.warning(
+                    "reconcile: steps with NULL enrollment.mailbox_id dropped",
+                    count=len(items),
+                )
                 continue
 
-            mbx = (
-                await db.execute(select(Mailbox).where(Mailbox.id == mailbox_id))
-            ).scalar_one_or_none()
+            mbx = mailboxes.get(mailbox_id)
+            if mbx is None:
+                # A missing Mailbox row (deleted mailbox, stale FK) is an error,
+                # NOT "exhausted". Falling through to daily_limit=0 would stall
+                # these steps forever behind a metric that looks like normal
+                # capping.
+                skipped_mailbox_missing += len(items)
+                per_mailbox_out[mailbox_id] = {
+                    "reconciled": 0,
+                    "pending": pending,
+                    "reason": "mailbox_missing",
+                }
+                logger.error(
+                    "reconcile: enrollment references missing mailbox row",
+                    mailbox_id=mailbox_id,
+                    past_due_steps=len(items),
+                )
+                continue
 
-            daily_limit = mbx.daily_send_limit if mbx else 0
-            sent_today = mbx.sent_today if mbx else 0
+            daily_limit = mbx.daily_send_limit
+            sent_today = mbx.sent_today
             spare = max(0, daily_limit - sent_today)
             floor = math.ceil(daily_limit * reserve_fraction)
             usable = max(0, spare - floor)
-            limit = min(per_mailbox_per_run, usable)
+            allowance = max(1, math.ceil(usable / sweeps_left))
+            limit = min(per_mailbox_per_run, allowance, usable)
 
             if limit <= 0:
                 if spare == 0:
@@ -142,10 +239,12 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                     reason = "reserve_floor"
                 per_mailbox_out[mailbox_id] = {
                     "reconciled": 0,
+                    "pending": pending,
                     "spare": spare,
                     "daily_limit": daily_limit,
                     "sent_today": sent_today,
                     "floor": floor,
+                    "allowance": allowance,
                     "reason": reason,
                 }
                 logger.info(
@@ -155,16 +254,20 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                     daily_limit=daily_limit,
                     sent_today=sent_today,
                     floor=floor,
+                    allowance=allowance,
                     reason=reason,
                 )
                 continue
 
             mailbox_reconciled = 0
-            for step, tenant_id in items[:limit]:
+            for row in items[:limit]:
+                step = await db.get(SequenceEnrollmentStep, row.step_id)
+                if step is None:
+                    continue
                 try:
                     await queue_sequence_step(
                         enrollment_step_id=step.id,
-                        tenant_id=tenant_id,
+                        tenant_id=row.tenant_id,
                         delay_seconds=None,
                     )
                 except Exception as exc:  # don't let one bad row block the sweep
@@ -181,10 +284,12 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
 
             per_mailbox_out[mailbox_id] = {
                 "reconciled": mailbox_reconciled,
+                "pending": pending,
                 "spare": spare,
                 "daily_limit": daily_limit,
                 "sent_today": sent_today,
                 "floor": floor,
+                "allowance": allowance,
                 "limit": limit,
             }
             reconciled += mailbox_reconciled
@@ -199,6 +304,8 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
         past_due_backlog_depth=backlog_depth,
         skipped_at_capacity=skipped_at_capacity,
         skipped_reserve_floor=skipped_reserve_floor,
+        skipped_mailbox_missing=skipped_mailbox_missing,
+        skipped_no_mailbox=skipped_no_mailbox,
         per_mailbox=per_mailbox_out,
     )
     return {
@@ -207,5 +314,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
         "past_due_backlog_depth": backlog_depth,
         "skipped_at_capacity": skipped_at_capacity,
         "skipped_reserve_floor": skipped_reserve_floor,
+        "skipped_mailbox_missing": skipped_mailbox_missing,
+        "skipped_no_mailbox": skipped_no_mailbox,
         "per_mailbox": per_mailbox_out,
     }

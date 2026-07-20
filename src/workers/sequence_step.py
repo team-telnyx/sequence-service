@@ -1,6 +1,7 @@
 """Sequence step processing worker."""
 
 import random
+import uuid
 from datetime import datetime, timedelta
 
 import structlog
@@ -23,6 +24,7 @@ from src.services.mailbox_rotation import (
     select_mailbox,
     reserve_send,
     release_send,
+    next_capacity_reset,
     seconds_until_capacity_reset,
 )
 from src.services.queue import queue_sequence_step
@@ -43,6 +45,60 @@ def _blank_content(subject, body) -> bool:
     email. Treats None / empty / whitespace-only subject OR body as blank.
     """
     return not (subject or "").strip() or not (body or "").strip()
+
+
+async def _defer_step(
+    db,
+    enrollment_step: SequenceEnrollmentStep,
+    fire_at: datetime,
+    delay_seconds: int,
+    tenant_id: str,
+) -> None:
+    """Stamp a step's `scheduled_at` to an ABSOLUTE naive-UTC fire time and
+    re-enqueue it for that fire time, so the arq dedup key
+    (`step:{id}:{int(UTC-aware scheduled_at.timestamp())}`) is STABLE across
+    repeated defers for the same intended fire time — the root cause of the
+    2026-07-20 83k-job arq flood (relative `utcnow() + delay` let the result
+    land anywhere in the final second before the reset depending on
+    `utcnow()`'s microsecond fraction, so the dedup key varied and arq did
+    not collapse; ~27 dupes/step).
+
+    `fire_at` MUST be naive UTC (tzinfo is None). The
+    `sequence_enrollment_steps.scheduled_at` column is
+    `timestamp WITHOUT time zone` holding naive UTC; assigning an aware
+    datetime would error or silently shift the value (this repo has been
+    bitten three times today by naive/aware UTC confusion, so be explicit).
+
+    The two callers compute `fire_at` DIFFERENTLY by design:
+
+    - **Capacity branch**: `next_capacity_reset().replace(tzinfo=None)`.
+      `next_capacity_reset()` returns the next 00:05 UTC instant with
+      second=0, microsecond=0 — identical for every call in the day, so every
+      defer of a given step produces EXACTLY ONE dedup key (collapses ~27
+      dupes/step to 1). It is tz-aware (`datetime.now(timezone.utc)`), so the
+      `.replace(tzinfo=None)` is required before storing. An absolute target
+      is available because the reset instant is independent of the caller.
+
+    - **Send-window branch**: `check_send_window(tz)` returns a RELATIVE
+      delay and the window opening is recipient-timezone dependent, so no
+      absolute target exists at call time. `fire_at` is
+      `(datetime.utcnow() + timedelta(seconds=window_delay))` floored to the
+      minute (`.replace(second=0, microsecond=0)`) so repeated defers within
+      the same minute share a key. This branch is secondary — it accounts for
+      ~111 jobs vs 78,436 from the capacity path.
+
+    `delay_seconds` is the arq `_defer_by` (relative delta) — kept as-is for
+    both branches so arq fires the job at the intended instant even when
+    `fire_at` was floored.
+    """
+    enrollment_step.scheduled_at = fire_at
+    await db.commit()
+    await queue_sequence_step(
+        enrollment_step_id=enrollment_step.id,
+        tenant_id=tenant_id,
+        scheduled_at=fire_at,
+        delay_seconds=delay_seconds,
+    )
 
 
 def compute_next_scheduled_at(
@@ -158,10 +214,20 @@ async def process_sequence_step(
                 enrollment_step_id=enrollment_step_id,
                 delay_seconds=window_delay,
             )
-            await queue_sequence_step(
-                enrollment_step_id=enrollment_step_id,
-                tenant_id=tenant_id,
+            # No absolute target is available — `check_send_window(tz)` returns
+            # a RELATIVE delay and the window opening is recipient-timezone
+            # dependent. Floor to the minute so repeated defers within the same
+            # minute share a dedup key (secondary branch — accounts for ~111
+            # jobs vs 78,436 from the capacity path; see `_defer_step`).
+            fire_at = (datetime.utcnow() + timedelta(seconds=window_delay)).replace(
+                second=0, microsecond=0
+            )
+            await _defer_step(
+                db=db,
+                enrollment_step=enrollment_step,
+                fire_at=fire_at,
                 delay_seconds=window_delay,
+                tenant_id=tenant_id,
             )
             return {
                 "skipped": True,
@@ -241,10 +307,20 @@ async def process_sequence_step(
                 mailbox_id=mailbox.id,
                 delay_seconds=defer_delay,
             )
-            await queue_sequence_step(
-                enrollment_step_id=enrollment_step_id,
-                tenant_id=tenant_id,
+            # ABSOLUTE target available: `next_capacity_reset()` returns the
+            # next 00:05 UTC instant with second=0, microsecond=0 — identical
+            # for every call in the day, so every defer of a given step
+            # produces EXACTLY ONE dedup key (collapses ~27 dupes/step to 1).
+            # It is tz-aware (`datetime.now(timezone.utc)`); the
+            # `scheduled_at` column is naive UTC so `.replace(tzinfo=None)`
+            # is required before storing (see `_defer_step`).
+            fire_at = next_capacity_reset().replace(tzinfo=None)
+            await _defer_step(
+                db=db,
+                enrollment_step=enrollment_step,
+                fire_at=fire_at,
                 delay_seconds=defer_delay,
+                tenant_id=tenant_id,
             )
             return {"deferred": True, "reason": "mailbox_at_capacity"}
 
@@ -285,9 +361,6 @@ async def process_sequence_step(
             enrollment_step.status = EnrollmentStepStatus.SKIPPED
             await db.commit()
             return {"skipped": True, "reason": "empty_content_blocked"}
-
-        import uuid
-        from datetime import datetime
 
         # Create sent email record first (need ID for tracking)
         sent_email_id = str(uuid.uuid4())
@@ -532,6 +605,7 @@ async def _queue_next_step(
         job_id = await queue_sequence_step(
             enrollment_step_id=next_enrollment_step.id,
             tenant_id=tenant_id,
+            scheduled_at=next_enrollment_step.scheduled_at,
             delay_seconds=delay_seconds if delay_seconds > 0 else None,
         )
 

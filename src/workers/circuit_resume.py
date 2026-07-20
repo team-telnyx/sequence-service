@@ -47,7 +47,7 @@ async def _resume_mailbox(db, mailbox_id: str, limit: int) -> int:
     )).scalars().all()
 
     resumed = 0
-    requeue = []  # (step_id, tenant_id) — enqueue AFTER commit so the job sees ACTIVE
+    requeue = []  # (step_id, tenant_id, scheduled_at) — enqueue AFTER commit so the job sees ACTIVE
     for e in enrollments:
         # DEFENSE-IN-DEPTH: only circuit_breaker-paused rows may EVER be auto-
         # resumed. reply / bounce / unsubscribe / manual / NULL rows must never
@@ -79,14 +79,19 @@ async def _resume_mailbox(db, mailbox_id: str, limit: int) -> int:
                 select(Sequence.tenant_id).where(Sequence.id == e.sequence_id)
             )).scalar_one_or_none()
             if tenant_id:
-                requeue.append((nxt.id, tenant_id))
+                requeue.append((nxt.id, tenant_id, nxt.scheduled_at))
         resumed += 1
 
     await db.commit()
 
-    for step_id, tenant_id in requeue:
+    for step_id, tenant_id, scheduled_at in requeue:
         try:
-            await queue_sequence_step(enrollment_step_id=step_id, tenant_id=tenant_id, delay_seconds=None)
+            await queue_sequence_step(
+                enrollment_step_id=step_id,
+                tenant_id=tenant_id,
+                scheduled_at=scheduled_at,
+                delay_seconds=None,
+            )
         except Exception as exc:
             logger.error("circuit_resume: re-enqueue failed", enrollment_step_id=step_id, error=str(exc))
 

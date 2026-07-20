@@ -2,7 +2,7 @@
 
 from arq import create_pool
 from arq.connections import RedisSettings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
@@ -81,7 +81,17 @@ async def queue_sequence_step(
     pool = await get_redis_pool()
 
     defer_by = timedelta(seconds=delay_seconds) if delay_seconds else None
-    job_id = f"step:{enrollment_step_id}:{int(scheduled_at.timestamp())}"
+    # `scheduled_at` may be NAIVE (column is `timestamp WITHOUT time zone` and
+    # most callers pass `datetime.utcnow()` results) or AWARE. `.timestamp()` on
+    # a naive datetime interprets it as LOCAL time — so the same `scheduled_at`
+    # maps to a different epoch under different `TZ` env values (or across a DST
+    # transition), and re-enqueues mint duplicates instead of deduping. Normalize
+    # to UTC before keying (REVOPS-1373 review finding 4).
+    if scheduled_at.tzinfo is None:
+        utc_scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+    else:
+        utc_scheduled_at = scheduled_at.astimezone(timezone.utc)
+    job_id = f"step:{enrollment_step_id}:{int(utc_scheduled_at.timestamp())}"
 
     job = await pool.enqueue_job(
         'process_sequence_step',

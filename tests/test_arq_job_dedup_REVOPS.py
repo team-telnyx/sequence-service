@@ -21,7 +21,7 @@ so callers that capture the return (enrollments.py:306, sequence_step.py:532)
 must be None-safe.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -89,7 +89,7 @@ def _fake_job_with_id(jid):
 @pytest.mark.asyncio
 async def test_job_id_format_is_step_id_and_scheduled_at_timestamp(monkeypatch):
     """The `_job_id` passed to `pool.enqueue_job` must be
-    `f"step:{enrollment_step_id}:{int(scheduled_at.timestamp())}"`.
+    `f"step:{enrollment_step_id}:{int(UTC_normalized_scheduled_at.timestamp())}"`.
 
     Pinning the exact format guards against someone "simplifying" to a bare
     `f"step:{id}"` — which would collapse re-enqueues correctly today but arq
@@ -98,6 +98,9 @@ async def test_job_id_format_is_step_id_and_scheduled_at_timestamp(monkeypatch):
     SILENTLY REFUSED and stranded forever. Including `scheduled_at` means a
     genuine re-schedule (reconciler stamps `scheduled_at=now` before enqueueing)
     always produces a new id.
+
+    The naive `scheduled_at` is interpreted as UTC (not local) before keying —
+    see finding 4. Tests under any `TZ` env value must produce the same key.
     """
     captured = {}
 
@@ -109,15 +112,16 @@ async def test_job_id_format_is_step_id_and_scheduled_at_timestamp(monkeypatch):
     _patch_pool(monkeypatch, _FakePool(_capture))
 
     step_id = "estep-abc"
-    sched = datetime(2026, 7, 20, 12, 0, 0)
+    sched = datetime(2026, 7, 20, 12, 0, 0)  # naive
     await queue_mod.queue_sequence_step(
         enrollment_step_id=step_id,
         tenant_id="t1",
         scheduled_at=sched,
     )
     job_id = captured["kwargs"].get("_job_id")
-    assert job_id == f"step:{step_id}:{int(sched.timestamp())}", (
-        f"job_id must be 'step:{{id}}:{{int(scheduled_at.timestamp())}}'; got {job_id!r}"
+    expected = f"step:{step_id}:{int(sched.replace(tzinfo=timezone.utc).timestamp())}"
+    assert job_id == expected, (
+        f"job_id must be 'step:{{id}}:{{int(UTC-aware scheduled_at.timestamp())}}'; got {job_id!r}"
     )
 
 
@@ -159,9 +163,14 @@ async def test_duplicate_enqueue_for_same_step_and_scheduled_at_dedupes(monkeypa
     )
     # Same _job_id both calls → dedup
     assert calls[0][2]["_job_id"] == calls[1][2]["_job_id"]
-    # Second call hit the None path: must not raise, and must return the
-    # deterministic id (or None) — the contract is just "no AttributeError".
-    assert r2 is None or r2 == calls[0][2]["_job_id"]
+    # Second call hit the None path: must return None outright (the contract
+    # the reconciler depends on at reconcile.py:297 — `if job_id is None:
+    # continue` — to avoid counting a deduped enqueue as a fresh
+    # reconciliation). A regression to returning the id would silently
+    # over-count `reconciled` (finding 2).
+    assert r2 is None, (
+        f"deduped enqueue must return None (reconciler None contract); got {r2!r}"
+    )
 
 
 # ── Re-schedule: same step_id + DIFFERENT scheduled_at → NEW job ────────────
@@ -304,11 +313,21 @@ async def test_queue_next_step_handles_deduped_enqueue_return(
             current_step_number=1,
             tenant_id=seeded["tenant_id"],
         )
-    # _queue_next_step returns a dict on success; the deduped enqueue path
-    # must not crash — assert it returned a dict (None also acceptable since
-    # the except branch logs and returns None, but NO AttributeError).
-    assert out is None or isinstance(out, dict), (
-        f"deduped enqueue must not AttributeError; got {out!r}"
+    # _queue_next_step returns a dict on success with keys
+    # `enrollment_step_id`, `step_number`, `delay_seconds`, `job_id`. The
+    # deduped enqueue path (job_id=None) must not crash and must still return
+    # the dict shape — `_queue_next_step` only returns None in its except branch
+    # (logged failure), so a dedup is NOT a None path here. Pin the shape so a
+    # regression to None (which would silently drop the next-step bookkeeping)
+    # is caught (finding 2).
+    assert isinstance(out, dict), (
+        f"deduped enqueue must not AttributeError and must return the dict shape; got {out!r}"
+    )
+    assert out.get("enrollment_step_id") == "es-next", (
+        f"next-step dict must reference the next enrollment step; got {out!r}"
+    )
+    assert out.get("job_id") is None, (
+        f"deduped enqueue must surface job_id=None to the caller; got {out!r}"
     )
 
 
@@ -419,11 +438,12 @@ async def test_reconciler_sweep_double_enqueue_dedupes(
 @pytest.mark.asyncio
 async def test_job_id_format_explicit_invariant(monkeypatch):
     """Cross-check: the _job_id has exactly the form
-    `step:{enrollment_step_id}:{int(scheduled_at.timestamp())}`.
+    `step:{enrollment_step_id}:{int(UTC_normalized_scheduled_at.timestamp())}`.
 
     This test exists separately from `test_job_id_format_is_step_id_and_scheduled_at_timestamp`
     to pin the invariant from a second angle (no arq-pool simulation), so that
-    a regression that simplifies to `step:{id}` is caught twice.
+    a regression that simplifies to `step:{id}` is caught twice. The naive
+    `scheduled_at` is interpreted as UTC before keying (finding 4).
     """
     captured = {}
 
@@ -433,14 +453,452 @@ async def test_job_id_format_explicit_invariant(monkeypatch):
 
     _patch_pool(monkeypatch, _FakePool(_enqueue))
 
-    sched = datetime(2026, 7, 20, 9, 30, 0)
+    sched = datetime(2026, 7, 20, 9, 30, 0)  # naive
     await queue_mod.queue_sequence_step(
         enrollment_step_id="estep-invariant",
         tenant_id="t",
         scheduled_at=sched,
     )
-    expected = f"step:estep-invariant:{int(sched.timestamp())}"
+    expected = (
+        f"step:estep-invariant:{int(sched.replace(tzinfo=timezone.utc).timestamp())}"
+    )
     assert captured["job_id"] == expected, (
         f"explicit format invariant violated: expected {expected!r}, "
         f"got {captured['job_id']!r}"
+    )
+
+
+# ── Finding 1 (PRIMARY): capacity-defer must produce a STABLE fire time ───────
+# Live 2026-07-20: 78,436 of 83,286 queued arq jobs sit in a single hour bucket
+# at the 00:05 UTC capacity reset — ~27 dupes/step. The relative fire-time
+# `datetime.utcnow() + timedelta(seconds=seconds_until_capacity_reset())` lets
+# the result land anywhere in the final second before the reset depending on
+# `utcnow()`'s microsecond fraction, giving TWO possible
+# `int(scheduled_at.timestamp())` values per step per reset instead of one — so
+# the dedup key still varies and arq does not collapse. The fix uses the
+# ABSOLUTE `next_capacity_reset()` (already exists in mailbox_rotation.py),
+# which returns the reset instant with second=0, microsecond=0 — identical for
+# every call in the day. This guard fails on the relative implementation.
+
+
+@pytest.mark.asyncio
+async def test_capacity_defer_produces_identical_job_id_across_microsecond_skew(
+    seeded, session_factory, monkeypatch
+):
+    """Two capacity-defer enqueues for the SAME step made at different microsecond
+    offsets within the same reset window must produce the SAME `_job_id`.
+
+    Drives the real `process_sequence_step` through the at-capacity path with
+    `utcnow()` patched to two different microsecond fractions straddling a whole-
+    second boundary (0.0 and 0.5). With the relative implementation:
+      call 1: utcnow=12:00:00.0, delta=3900.0, int=3900, sched=13:05:00.0
+      call 2: utcnow=12:00:00.5, delta=3899.5, int=3899, sched=13:04:59.5
+    → two different `int(scheduled_at.timestamp())` → two different _job_ids.
+    With the absolute fix both calls produce `next_capacity_reset()` (a single
+    instant with second=0, microsecond=0) → one _job_id.
+    """
+    # Real queue_sequence_step with a capturing fake pool.
+    captured_sched = []
+
+    async def _enqueue(name, *args, **kwargs):
+        captured_sched.append(kwargs["_job_id"])
+        return _fake_job_with_id(kwargs["_job_id"])
+
+    _patch_pool(monkeypatch, _FakePool(_enqueue))
+
+    # Make an enrollment whose sticky mailbox is at the hard cap so the worker
+    # takes the capacity-defer path.
+    async with session_factory() as s:
+        s.add(
+            SequenceEnrollment(
+                id="enr-cap-dedup",
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=seeded["full_mailbox_id"],  # sent_today == daily_send_limit
+                contact_email="capdedup@acme.com",
+                contact_name="CD",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=0,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="estep-cap-dedup",
+                enrollment_id="enr-cap-dedup",
+                step_id="step-1",
+                mailbox_id=seeded["full_mailbox_id"],
+                status=EnrollmentStepStatus.PENDING,
+                scheduled_at=None,
+                custom_subject="Hi",
+                custom_body="<p>Body</p>",
+            )
+        )
+        await s.commit()
+
+    # Patch async_session and queue_sequence_step on the worker module so the
+    # real queue_sequence_step (with our capturing pool) is exercised.
+    from src.services import queue as queue_mod
+    from src.services import mailbox_rotation as mb
+
+    # Two utcnow values that straddle a whole-second boundary relative to the
+    # next reset (12:00:00.0 and 12:00:00.5 vs reset at 13:05:00.0). The relative
+    # impl computes `defer_delay = seconds_until_capacity_reset()` (truncated
+    # whole seconds) THEN `scheduled = utcnow + defer_delay`. With a fixed
+    # reset instant, the two calls produce:
+    #   call 1: utcnow=12:00:00.0, delta=3900.0 → int=3900 → sched=13:05:00.0
+    #   call 2: utcnow=12:00:00.5, delta=3899.5 → int=3899 → sched=13:04:59.5
+    # → two different `int(scheduled_at.timestamp())` → two _job_ids.
+    # The absolute fix uses `next_capacity_reset()` directly so both calls
+    # produce 13:05:00.0 → one _job_id.
+    fixed_targets = [
+        datetime(2026, 7, 20, 12, 0, 0, 0),  # microsecond=0
+        datetime(2026, 7, 20, 12, 0, 0, 500000),  # microsecond=0.5
+    ]
+    reset_target = datetime(2026, 7, 20, 13, 5, 0, 0)  # 00:05 UTC the next day
+
+    call_index = {"i": 0}
+
+    class _PatchedDatetime(datetime):
+        @classmethod
+        def utcnow(cls):
+            idx = call_index["i"]
+            call_index["i"] = idx + 1
+            return fixed_targets[idx]
+
+    # `seconds_until_capacity_reset` uses its own datetime.now(timezone.utc)
+    # (real clock), so patch it to return the truncated delta consistent with
+    # our patched utcnow — otherwise both calls get the same defer_delay and
+    # never straddle. NB: the worker calls `seconds_until_capacity_reset()`
+    # BEFORE `datetime.utcnow()` (line 248 then 260), so we peek the next
+    # fixed_target (not yet consumed) to compute the delta.
+    def _fake_seconds_until_reset(_now=None):
+        idx = min(call_index["i"], len(fixed_targets) - 1)
+        delta = (reset_target - fixed_targets[idx]).total_seconds()
+        return max(1, int(delta))
+
+    monkeypatch.setattr(mb, "seconds_until_capacity_reset", _fake_seconds_until_reset)
+    monkeypatch.setattr(ss, "seconds_until_capacity_reset", _fake_seconds_until_reset)
+    monkeypatch.setattr(ss, "datetime", _PatchedDatetime)
+
+    with (
+        patch.object(ss, "async_session", session_factory),
+        patch.object(ss, "queue_sequence_step", queue_mod.queue_sequence_step),
+    ):
+        await ss.process_sequence_step({}, "estep-cap-dedup", seeded["tenant_id"])
+        await ss.process_sequence_step({}, "estep-cap-dedup", seeded["tenant_id"])
+
+    # The two enqueues must produce the SAME _job_id. With the relative impl
+    # they differ because `int(scheduled_at.timestamp())` straddles the second
+    # boundary (13:05:00.0 → epoch X; 13:04:59.5 → epoch X-1).
+    assert len(captured_sched) == 2, (
+        f"expected 2 enqueues, got {len(captured_sched)}: {captured_sched}"
+    )
+    assert captured_sched[0] == captured_sched[1], (
+        "capacity-defer for the SAME step at different microsecond offsets must "
+        "produce the SAME _job_id (absolute reset instant) — relative "
+        "implementation lets utcnow()'s microsecond fraction shift "
+        "int(scheduled_at.timestamp()) across a second boundary. "
+        f"got {captured_sched}"
+    )
+
+
+# ── Test (b): stored scheduled_at is naive after a capacity defer ────────────
+# The `sequence_enrollment_steps.scheduled_at` column is
+# `timestamp WITHOUT time zone` holding naive UTC. `next_capacity_reset()`
+# returns a tz-aware datetime (uses `datetime.now(timezone.utc)`); assigning
+# it aware would error or silently shift the value. The capacity branch MUST
+# `.replace(tzinfo=None)` before storing.
+
+
+@pytest.mark.asyncio
+async def test_capacity_defer_stores_naive_scheduled_at(
+    seeded, session_factory, monkeypatch
+):
+    """After a capacity-defer, the step's `scheduled_at` must be naive
+    (tzinfo is None) — guards against the aware-datetime-into-naive-column
+    trap this repo has been bitten by three times today.
+    """
+    captured_sched = []
+
+    async def _enqueue(name, *args, **kwargs):
+        captured_sched.append(kwargs.get("_job_id"))
+        return _fake_job_with_id(kwargs["_job_id"])
+
+    _patch_pool(monkeypatch, _FakePool(_enqueue))
+
+    async with session_factory() as s:
+        s.add(
+            SequenceEnrollment(
+                id="enr-naive",
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=seeded["full_mailbox_id"],
+                contact_email="naive@acme.com",
+                contact_name="N",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=0,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="estep-naive",
+                enrollment_id="enr-naive",
+                step_id="step-1",
+                mailbox_id=seeded["full_mailbox_id"],
+                status=EnrollmentStepStatus.PENDING,
+                scheduled_at=None,
+                custom_subject="Hi",
+                custom_body="<p>Body</p>",
+            )
+        )
+        await s.commit()
+
+    from src.services import queue as queue_mod
+
+    with (
+        patch.object(ss, "async_session", session_factory),
+        patch.object(ss, "queue_sequence_step", queue_mod.queue_sequence_step),
+    ):
+        await ss.process_sequence_step({}, "estep-naive", seeded["tenant_id"])
+
+    async with session_factory() as s:
+        step = await s.get(SequenceEnrollmentStep, "estep-naive")
+        assert step.scheduled_at is not None, "defer must set scheduled_at"
+        assert step.scheduled_at.tzinfo is None, (
+            f"stored scheduled_at must be naive (tzinfo is None) — the column "
+            f"is `timestamp WITHOUT time zone`. got tzinfo={step.scheduled_at.tzinfo!r}, "
+            f"value={step.scheduled_at!r}"
+        )
+
+
+# ── Test (c): dedup key is identical under two different TZ env values ──────
+# `.timestamp()` on a naive datetime interprets it as LOCAL time, so the key
+# would change with ambient TZ. The fix normalizes to UTC before keying. Use
+# `os.environ['TZ']` + `time.tzset()` to prove the key is TZ-invariant.
+
+
+@pytest.mark.asyncio
+async def test_dedup_key_is_tz_invariant(monkeypatch):
+    """The same naive `scheduled_at` produces the SAME `_job_id` under two
+    different `TZ` env values. Without the UTC normalization the key would
+    vary with ambient TZ (and across a DST transition would silently re-enqueue
+    duplicates instead of deduping).
+    """
+    import os
+    import time
+
+    captured = []
+
+    async def _capture(name, *args, **kwargs):
+        captured.append(kwargs["_job_id"])
+        return _fake_job_with_id(kwargs["_job_id"])
+
+    _patch_pool(monkeypatch, _FakePool(_capture))
+
+    sched = datetime(2026, 7, 20, 17, 30, 0)  # naive
+    expected = f"step:estep-tz:{int(sched.replace(tzinfo=timezone.utc).timestamp())}"
+
+    saved_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/Chicago"
+        time.tzset()
+        await queue_mod.queue_sequence_step(
+            enrollment_step_id="estep-tz",
+            tenant_id="t1",
+            scheduled_at=sched,
+        )
+        key_chicago = captured[-1]
+
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        await queue_mod.queue_sequence_step(
+            enrollment_step_id="estep-tz",
+            tenant_id="t1",
+            scheduled_at=sched,
+        )
+        key_utc = captured[-1]
+    finally:
+        if saved_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved_tz
+        time.tzset()
+
+    assert key_chicago == expected, (
+        f"key under America/Chicago must match UTC-normalized expected; "
+        f"got {key_chicago!r} expected {expected!r}"
+    )
+    assert key_utc == expected, (
+        f"key under UTC must match UTC-normalized expected; "
+        f"got {key_utc!r} expected {expected!r}"
+    )
+    assert key_chicago == key_utc, (
+        "dedup key must be TZ-invariant — same naive scheduled_at under "
+        "different TZ env values must produce the same _job_id. "
+        f"chicago={key_chicago!r} utc={key_utc!r}"
+    )
+
+
+# ── Test (d): reconciler enqueue failure leaves scheduled_at unchanged ──────
+# Pre-PR behavior advanced `scheduled_at` only on success. The current code
+# advances BEFORE the enqueue try-block, so an enqueue exception commits the
+# advance at the end of the loop. The fix reverts `scheduled_at` and
+# decrements `mailbox_advanced` on the exception path, so the step IS
+# re-selectable on the next sweep (no 900s grace-window stranding).
+
+
+@pytest.mark.asyncio
+async def test_reconciler_enqueue_failure_leaves_scheduled_at_unchanged(
+    seeded, session_factory, monkeypatch
+):
+    """An enqueue exception in the reconciler must revert the step's
+    `scheduled_at` to its original past-due value and decrement
+    `mailbox_advanced`, so the step IS re-selected on the next sweep.
+    """
+    monkeypatch.setattr(rec.settings, "reconcile_pacing_window_hours", 1, raising=False)
+    monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
+
+    past = datetime.utcnow() - timedelta(hours=2)
+    async with session_factory() as s:
+        s.add(
+            SequenceEnrollment(
+                id="enr-fail",
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=seeded["active_mailbox_id"],
+                contact_email="fail@acme.com",
+                contact_name="F",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=1,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="estep-fail",
+                enrollment_id="enr-fail",
+                step_id="step-1",
+                mailbox_id=None,
+                status=EnrollmentStepStatus.SCHEDULED,
+                scheduled_at=past,
+                custom_subject="Hi",
+                custom_body="<p>B</p>",
+            )
+        )
+        await s.commit()
+
+    # Real queue_sequence_step that ALWAYS raises (simulates redis down).
+    async def _raising_enqueue(*args, **kwargs):
+        raise RuntimeError("redis down — simulating enqueue failure")
+
+    cms = [
+        patch.object(rec, "async_session", session_factory),
+        patch.object(rec, "queue_sequence_step", _raising_enqueue),
+    ]
+    for c in cms:
+        c.start()
+    try:
+        out = await rec.reconcile_scheduled_steps({})
+    finally:
+        for c in cms:
+            c.stop()
+
+    # The reconciler must not count the failed step as reconciled, and must
+    # report advanced=0 (the revert cancels the would-be advance).
+    assert out["reconciled"] == 0, (
+        f"failed enqueue must not count as reconciled; got {out['reconciled']}"
+    )
+    assert out.get("advanced") == 0, (
+        f"failed enqueue must revert the advance (advanced=0); got {out.get('advanced')}"
+    )
+
+    # The step's scheduled_at must be UNCHANGED (still past-due, re-selectable
+    # on the next sweep).
+    async with session_factory() as s:
+        step = await s.get(SequenceEnrollmentStep, "estep-fail")
+        assert step.scheduled_at == past, (
+            f"failed enqueue must leave scheduled_at unchanged (re-selectable); "
+            f"expected {past!r}, got {step.scheduled_at!r}"
+        )
+        assert step.status == EnrollmentStepStatus.SCHEDULED, (
+            f"failed enqueue must leave the step SCHEDULED; got {step.status}"
+        )
+
+
+# ── Test (e): `advanced` is present in the returned dict ─────────────────────
+# Finding 5: `advanced` was accumulated and gated the commit but was absent
+# from both the log line and the returned dict. An operator cannot tell
+# "reconciled 0 because everything deduped (healthy)" from "reconciled 0
+# because nothing was eligible" without it.
+
+
+@pytest.mark.asyncio
+async def test_reconciler_return_dict_contains_advanced(
+    seeded, session_factory, monkeypatch
+):
+    """The reconciler's returned dict must contain `advanced` alongside
+    `reconciled`, `skipped_at_capacity`, etc.
+    """
+    monkeypatch.setattr(rec.settings, "reconcile_pacing_window_hours", 1, raising=False)
+    monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
+
+    past = datetime.utcnow() - timedelta(hours=2)
+    async with session_factory() as s:
+        s.add(
+            SequenceEnrollment(
+                id="enr-adv",
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=seeded["active_mailbox_id"],
+                contact_email="adv@acme.com",
+                contact_name="A",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=1,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="estep-adv",
+                enrollment_id="enr-adv",
+                step_id="step-1",
+                mailbox_id=None,
+                status=EnrollmentStepStatus.SCHEDULED,
+                scheduled_at=past,
+                custom_subject="Hi",
+                custom_body="<p>B</p>",
+            )
+        )
+        await s.commit()
+
+    # Use a normal enqueue that returns a fake job id (newly enqueued).
+    async def _ok_enqueue(*args, **kwargs):
+        return _fake_job_with_id("job-adv-1")
+
+    cms = [
+        patch.object(rec, "async_session", session_factory),
+        patch.object(rec, "queue_sequence_step", _ok_enqueue),
+    ]
+    for c in cms:
+        c.start()
+    try:
+        out = await rec.reconcile_scheduled_steps({})
+    finally:
+        for c in cms:
+            c.stop()
+
+    assert "advanced" in out, (
+        f"returned dict must contain 'advanced' (finding 5); keys={list(out.keys())}"
+    )
+    assert out["advanced"] == 1, (
+        f"one step reconciled → advanced must be 1; got {out['advanced']}"
+    )
+    assert out["reconciled"] == 1, (
+        f"one step reconciled → reconciled must be 1; got {out['reconciled']}"
+    )
+    # Also check per_mailbox carries advanced for the active mailbox.
+    pm = out.get("per_mailbox", {})
+    assert seeded["active_mailbox_id"] in pm, (
+        f"per_mailbox must include the active mailbox; got {list(pm.keys())}"
+    )
+    assert "advanced" in pm[seeded["active_mailbox_id"]], (
+        f"per_mailbox entry must contain 'advanced'; keys={list(pm[seeded['active_mailbox_id']].keys())}"
     )

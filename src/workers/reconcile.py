@@ -67,10 +67,19 @@ logger = structlog.get_logger()
 async def reconcile_scheduled_steps(ctx: dict) -> dict:
     """Re-enqueue stuck SCHEDULED steps with per-mailbox capacity pacing.
 
-    Returns {"reconciled": n, "scanned": m, "past_due_backlog_depth": d,
-    "skipped_at_capacity": k, "skipped_reserve_floor": j,
-    "skipped_mailbox_missing": p, "skipped_no_mailbox": q,
-    "per_mailbox": {mailbox_id: {reconciled, pending, spare, ...}}}.
+    Returns {"reconciled": n, "advanced": a, "scanned": m,
+    "past_due_backlog_depth": d, "skipped_at_capacity": k,
+    "skipped_reserve_floor": j, "skipped_mailbox_missing": p,
+    "skipped_no_mailbox": q, "per_mailbox": {mailbox_id: {reconciled, advanced,
+    pending, spare, ...}}}.
+
+    `reconciled` counts ONLY newly-enqueued jobs (a deduped enqueue returns
+    None and is not counted). `advanced` counts every step whose
+    `scheduled_at` was pushed forward (including deduped enqueues, which still
+    advance the row so the next sweep doesn't re-select). An operator can tell
+    "reconciled 0 because everything deduped (healthy — jobs already in
+    flight; advanced > 0)" from "reconciled 0 because nothing was eligible
+    (advanced == 0)" — finding 5.
     """
     grace = timedelta(seconds=getattr(settings, "reconcile_grace_seconds", 600))
     batch_limit = getattr(settings, "reconcile_batch_limit", 100)
@@ -267,11 +276,12 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                 if step is None:
                     continue
                 # Stamp the new fire time BEFORE enqueue so the dedup key
-                # (`step:{id}:{int(scheduled_at.timestamp())}`) matches the row's
-                # scheduled_at. A re-enqueue for the same fire time (e.g. a
-                # second sweep before this step's job fires) is then collapsed
-                # by arq's `_job_id` dedup instead of minting a fresh uuid4 —
-                # the root cause of the 2026-07-20 83k-job flood.
+                # (`step:{id}:{int(UTC-aware scheduled_at.timestamp())}`) matches
+                # the row's scheduled_at. A re-enqueue for the same fire time
+                # (e.g. a second sweep before this step's job fires) is then
+                # collapsed by arq's `_job_id` dedup instead of minting a fresh
+                # uuid4 — the root cause of the 2026-07-20 83k-job flood.
+                original_scheduled_at = row.scheduled_at
                 step.scheduled_at = now
                 mailbox_advanced += 1
                 try:
@@ -287,6 +297,17 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                         enrollment_step_id=step.id,
                         error=str(exc),
                     )
+                    # Revert: the enqueue failed so no arq job exists for this
+                    # step. Pre-PR behavior advanced `scheduled_at` only on
+                    # success; restoring that contract keeps the step
+                    # re-selectable on the NEXT sweep (inside the grace window
+                    # the dedup guard would skip it, but only for ~900s — after
+                    # that it would be silently stranded until a backfill).
+                    # Without the revert the step has no job, sits inside the
+                    # 900s grace window, is skipped by the next sweep, and is
+                    # only re-selected ~20 min later (finding 3).
+                    step.scheduled_at = original_scheduled_at
+                    mailbox_advanced -= 1
                     continue
                 # queue_sequence_step returns None when arq deduped the enqueue
                 # (a job with this _job_id was already queued — likely a
@@ -300,6 +321,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
 
             per_mailbox_out[mailbox_id] = {
                 "reconciled": mailbox_reconciled,
+                "advanced": mailbox_advanced,
                 "pending": pending,
                 "spare": spare,
                 "daily_limit": daily_limit,
@@ -322,6 +344,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
     logger.info(
         "reconcile_scheduled_steps complete",
         reconciled=reconciled,
+        advanced=advanced,
         scanned=len(rows),
         past_due_backlog_depth=backlog_depth,
         skipped_at_capacity=skipped_at_capacity,
@@ -332,6 +355,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
     )
     return {
         "reconciled": reconciled,
+        "advanced": advanced,
         "scanned": len(rows),
         "past_due_backlog_depth": backlog_depth,
         "skipped_at_capacity": skipped_at_capacity,

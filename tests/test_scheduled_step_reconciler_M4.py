@@ -165,6 +165,10 @@ async def test_non_scheduled_status_ignored(seeded, session_factory, status):
 @pytest.mark.asyncio
 async def test_batch_limit_respected(seeded, session_factory, monkeypatch):
     monkeypatch.setattr(rec.settings, "reconcile_batch_limit", 2, raising=False)
+    # Make per-mailbox pacing non-binding so batch_limit is the cap under test.
+    # mb-active (50/10 -> usable 25); default 9h window -> allowance 1 < 2, which
+    # would make pacing bind instead of batch_limit. 1h window -> allowance 5.
+    monkeypatch.setattr(rec.settings, "reconcile_pacing_window_hours", 1, raising=False)
     past = datetime.utcnow() - timedelta(hours=2)
     for i in range(5):
         await _make_step(session_factory, seeded, status=EnrollmentStepStatus.SCHEDULED,
@@ -181,7 +185,9 @@ async def test_batch_limit_respected(seeded, session_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_one_enqueue_failure_does_not_block_others(seeded, session_factory):
+async def test_one_enqueue_failure_does_not_block_others(seeded, session_factory, monkeypatch):
+    # Make pacing non-binding so both steps are attempted (allowance >= 2).
+    monkeypatch.setattr(rec.settings, "reconcile_pacing_window_hours", 1, raising=False)
     past = datetime.utcnow() - timedelta(hours=2)
     for i in range(2):
         await _make_step(session_factory, seeded, status=EnrollmentStepStatus.SCHEDULED,

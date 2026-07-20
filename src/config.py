@@ -106,6 +106,28 @@ class Settings(BaseSettings):
     # is simply waiting on its defer.
     reconcile_grace_seconds: int = 900
     reconcile_batch_limit: int = 200
+    # Per-mailbox capacity pacing (REVOPS-1378 / 2026-07-20 incident): the
+    # reconciler previously re-enqueued up to reconcile_batch_limit(200) past-due
+    # steps with delay_seconds=None every 10 min — unpaced. Live 2026-07-20 this
+    # burned AMER's entire 300/day budget in one hour (251 sends in the 13:00 UTC
+    # hour; all 8 mailboxes at sent_today=daily_send_limit=75 by 09:30 ET),
+    # crowding out organic follow-ups and net-new admissions. These two settings
+    # mirror the existing circuit_resume.py:124-138 precedent: cap each
+    # mailbox's reconciliation per sweep, and reserve a fraction of
+    # daily_send_limit that the reconciler may never touch, so catch-up trickles
+    # in behind in-flight work instead of consuming the shared send cap.
+    reconcile_per_mailbox_per_run: int = 10
+    reconcile_new_send_reserve_fraction: float = 0.30
+    # The daily usable allowance is spread across this many hours so the
+    # reconciler trickles catch-up across the whole send window instead of
+    # emitting the full per-mailbox daily allowance in the first hour. Matches
+    # send_window_start=8 -> send_window_end=17 (REVOPS-1378 / 2026-07-20 review
+    # blocker 2: floor alone bounds the daily total, not the hourly rate).
+    reconcile_pacing_window_hours: int = 9
+    # MUST match the cron cadence in src/workers/main.py (minute=set(range(0,60,10))
+    # -> every 10 min). The two change together; if the cron is retuned this must
+    # track it or the allowance math mis-spreads the daily budget.
+    reconcile_sweep_minutes: int = 10
 
     # Circuit Breaker
     circuit_breaker_enabled: bool = True

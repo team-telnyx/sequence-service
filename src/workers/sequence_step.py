@@ -1,6 +1,7 @@
 """Sequence step processing worker."""
 
 import random
+import uuid
 from datetime import datetime, timedelta
 
 import structlog
@@ -158,9 +159,19 @@ async def process_sequence_step(
                 enrollment_step_id=enrollment_step_id,
                 delay_seconds=window_delay,
             )
+            # Update scheduled_at to the NEW fire time (now + delay) so the
+            # dedup key (`step:{id}:{int(scheduled_at.timestamp())}`) reflects
+            # this deferral, not the original (already-fired) fire time. Without
+            # this, the re-enqueue would collide with the original job's
+            # _job_id (still in arq's result store keep_result TTL) and be
+            # silently deduped — stranding the step.
+            new_scheduled_at = datetime.utcnow() + timedelta(seconds=window_delay)
+            enrollment_step.scheduled_at = new_scheduled_at
+            await db.commit()
             await queue_sequence_step(
                 enrollment_step_id=enrollment_step_id,
                 tenant_id=tenant_id,
+                scheduled_at=new_scheduled_at,
                 delay_seconds=window_delay,
             )
             return {
@@ -241,9 +252,18 @@ async def process_sequence_step(
                 mailbox_id=mailbox.id,
                 delay_seconds=defer_delay,
             )
+            # Update scheduled_at to the NEW fire time (now + delay) so the
+            # dedup key reflects this deferral, not the original fire time
+            # (which would collide with the already-fired job's _job_id and be
+            # silently deduped — stranding the step). Same pattern as the
+            # send-window re-queue above.
+            new_scheduled_at = datetime.utcnow() + timedelta(seconds=defer_delay)
+            enrollment_step.scheduled_at = new_scheduled_at
+            await db.commit()
             await queue_sequence_step(
                 enrollment_step_id=enrollment_step_id,
                 tenant_id=tenant_id,
+                scheduled_at=new_scheduled_at,
                 delay_seconds=defer_delay,
             )
             return {"deferred": True, "reason": "mailbox_at_capacity"}
@@ -285,9 +305,6 @@ async def process_sequence_step(
             enrollment_step.status = EnrollmentStepStatus.SKIPPED
             await db.commit()
             return {"skipped": True, "reason": "empty_content_blocked"}
-
-        import uuid
-        from datetime import datetime
 
         # Create sent email record first (need ID for tracking)
         sent_email_id = str(uuid.uuid4())
@@ -532,6 +549,7 @@ async def _queue_next_step(
         job_id = await queue_sequence_step(
             enrollment_step_id=next_enrollment_step.id,
             tenant_id=tenant_id,
+            scheduled_at=next_enrollment_step.scheduled_at,
             delay_seconds=delay_seconds if delay_seconds > 0 else None,
         )
 

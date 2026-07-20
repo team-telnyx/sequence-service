@@ -84,6 +84,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
     sweeps_left = max(1, math.ceil(pacing_window_hours * 60 / sweep_minutes))
 
     reconciled = 0
+    advanced = 0  # steps whose scheduled_at was pushed forward (incl. deduped)
     skipped_at_capacity = 0
     skipped_reserve_floor = 0
     skipped_mailbox_missing = 0
@@ -260,14 +261,24 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                 continue
 
             mailbox_reconciled = 0
+            mailbox_advanced = 0  # steps whose scheduled_at was pushed to now
             for row in items[:limit]:
                 step = await db.get(SequenceEnrollmentStep, row.step_id)
                 if step is None:
                     continue
+                # Stamp the new fire time BEFORE enqueue so the dedup key
+                # (`step:{id}:{int(scheduled_at.timestamp())}`) matches the row's
+                # scheduled_at. A re-enqueue for the same fire time (e.g. a
+                # second sweep before this step's job fires) is then collapsed
+                # by arq's `_job_id` dedup instead of minting a fresh uuid4 —
+                # the root cause of the 2026-07-20 83k-job flood.
+                step.scheduled_at = now
+                mailbox_advanced += 1
                 try:
-                    await queue_sequence_step(
+                    job_id = await queue_sequence_step(
                         enrollment_step_id=step.id,
                         tenant_id=row.tenant_id,
+                        scheduled_at=now,
                         delay_seconds=None,
                     )
                 except Exception as exc:  # don't let one bad row block the sweep
@@ -277,9 +288,14 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                         error=str(exc),
                     )
                     continue
-                # Reset the grace window so an in-flight step isn't re-selected
-                # next sweep.
-                step.scheduled_at = now
+                # queue_sequence_step returns None when arq deduped the enqueue
+                # (a job with this _job_id was already queued — likely a
+                # previous sweep's job still in-flight). Do NOT count it as a
+                # new reconciliation: the step is already being handled. The
+                # scheduled_at advance IS committed (below) so the next sweep
+                # doesn't re-select it.
+                if job_id is None:
+                    continue
                 mailbox_reconciled += 1
 
             per_mailbox_out[mailbox_id] = {
@@ -293,8 +309,14 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                 "limit": limit,
             }
             reconciled += mailbox_reconciled
+            advanced += mailbox_advanced
 
-        if reconciled:
+        # Commit the scheduled_at advances (and any status changes) whether or
+        # not new jobs were enqueued. Without this, a fully-deduped sweep would
+        # leave scheduled_at at the old past-due value, so the next sweep would
+        # re-select the same steps and re-dedupe forever — the step's
+        # scheduled_at never advances past the grace window.
+        if reconciled or advanced:
             await db.commit()
 
     logger.info(

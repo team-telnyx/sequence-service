@@ -278,6 +278,9 @@ async def create_enrollment(
     # Create enrollment steps for each sequence step (sorted by step_number)
     sorted_steps = sorted(sequence.steps, key=lambda s: s.step_number)
     first_enrollment_step_id = None
+    # Capture the first step's intended fire time once and reuse it for both
+    # the step row and the arq enqueue so the dedup key matches the row.
+    first_step_scheduled_at = datetime.utcnow()
 
     for i, step in enumerate(sorted_steps):
         composed = step_content_map.get(step.step_number)
@@ -288,7 +291,7 @@ async def create_enrollment(
             status=EnrollmentStepStatus.SCHEDULED if i == 0 else EnrollmentStepStatus.PENDING,
             # First step is queued for immediate processing; record scheduled_at
             # so the reconciler can recover it if its arq job is lost (audit M4).
-            scheduled_at=datetime.utcnow() if i == 0 else None,
+            scheduled_at=first_step_scheduled_at if i == 0 else None,
             custom_subject=composed.subject if composed else None,
             custom_body=composed.body if composed else None,
         )
@@ -306,6 +309,7 @@ async def create_enrollment(
             job_id = await queue_sequence_step(
                 enrollment_step_id=first_enrollment_step_id,
                 tenant_id=tenant_id,
+                scheduled_at=first_step_scheduled_at,
                 delay_seconds=0,
             )
             logger.info(
@@ -452,19 +456,22 @@ async def resume_enrollment(
         .limit(1)
     )).scalar_one_or_none()
     requeue_step_id = None
+    requeue_scheduled_at: Optional[datetime] = None
     if nxt is not None:
         nxt.status = EnrollmentStepStatus.SCHEDULED
         nxt.scheduled_at = datetime.utcnow()
         requeue_step_id = nxt.id
+        requeue_scheduled_at = nxt.scheduled_at
 
     await db.commit()
 
     # Enqueue AFTER commit so the worker sees the ACTIVE/SCHEDULED rows. A queue
     # failure must not undo the resume — the scheduled_at reconciler recovers it.
-    if requeue_step_id is not None:
+    if requeue_step_id is not None and requeue_scheduled_at is not None:
         try:
             await queue_sequence_step(
-                enrollment_step_id=requeue_step_id, tenant_id=tenant_id, delay_seconds=None,
+                enrollment_step_id=requeue_step_id, tenant_id=tenant_id,
+                scheduled_at=requeue_scheduled_at, delay_seconds=None,
             )
         except Exception as exc:
             logger.error(

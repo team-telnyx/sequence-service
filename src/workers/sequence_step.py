@@ -1,5 +1,6 @@
 """Sequence step processing worker."""
 
+import asyncio
 import random
 import uuid
 from datetime import datetime, timedelta
@@ -35,6 +36,18 @@ from src.services.suppression import check_suppressed
 
 settings = get_settings()
 logger = structlog.get_logger()
+
+
+def _gmail_call_locked(gmail, method, *args, **kwargs):
+    """Run a blocking GmailService method under the per-mailbox lock.
+
+    Runs in a worker thread via asyncio.to_thread. The lock serializes
+    same-mailbox calls so two concurrent arq jobs cannot interleave httplib2
+    HTTP state on the shared cached GmailService singleton. Different
+    mailboxes have different instances -> different locks -> stay concurrent.
+    """
+    with gmail._lock:
+        return method(*args, **kwargs)
 
 
 def _blank_content(subject, body) -> bool:
@@ -408,11 +421,18 @@ async def process_sequence_step(
         else:
             list_unsubscribe = mailto_unsub
 
-        # Send email via Gmail API
+        # Send email via Gmail API. Offload the blocking send to a worker thread
+        # (Fix 1) so the event loop stays responsive for the other 9 arq jobs.
+        # Acquire the per-mailbox lock (Fix 2) so two concurrent jobs on the
+        # SAME mailbox cannot interleave httplib2 state on the shared cached
+        # GmailService singleton.
         if settings.gmail_enabled:
             try:
                 gmail = GmailService.get_inbox(mailbox.email)
-                result = gmail.send_html_email(
+                result = await asyncio.to_thread(
+                    _gmail_call_locked,
+                    gmail,
+                    gmail.send_html_email,
                     to=enrollment.contact_email,
                     subject=subject,
                     html_body=html_body,

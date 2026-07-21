@@ -1,5 +1,6 @@
 """Signal detection worker - polls inboxes for replies, bounces, etc."""
 
+import asyncio
 import json
 from datetime import datetime, timedelta
 from typing import Optional
@@ -24,6 +25,18 @@ from src.services.webhooks import create_signal_webhook
 
 settings = get_settings()
 logger = structlog.get_logger()
+
+
+def _gmail_call_locked(gmail, method, *args, **kwargs):
+    """Run a blocking GmailService method under the per-mailbox lock.
+
+    Runs in a worker thread via asyncio.to_thread. The lock serializes
+    same-mailbox calls so two concurrent arq jobs cannot interleave httplib2
+    HTTP state on the shared cached GmailService singleton. Different
+    mailboxes have different instances -> different locks -> stay concurrent.
+    """
+    with gmail._lock:
+        return method(*args, **kwargs)
 
 
 async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
@@ -82,16 +95,67 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
         thread_to_sent = {se.thread_id: se for se in sent_emails if se.thread_id}
         thread_ids = list(thread_to_sent.keys())
         
+        # Incremental scan (Fix 3): skip threads that already have a TERMINAL
+        # signal recorded (REPLY -> enrollment PAUSED, BOUNCE -> BOUNCED).
+        # Re-fetching a terminal-signaled thread would only re-discover the
+        # same reply and hit the per-reply dedup below. Non-terminal signals
+        # (OUT_OF_OFFICE, OPEN, CLICK, UNSUBSCRIBE) do NOT stop the enrollment,
+        # so the contact may still send a genuine human REPLY later -- skipping
+        # on those would silently reintroduce the REVOPS-972 L3 late-reply
+        # failure the 21-day window exists to prevent. The per-reply
+        # Signal.raw_data dedup below stays as a safety net for threads that
+        # ARE fetched. The 21-day window stays intact -- we bound the WORK
+        # (threads fetched), not the window (cutoff). Steady-state fetch set =
+        # "threads still awaiting a terminal outcome," not ~0.
+        sent_email_ids = [se.id for se in sent_emails]
+        recorded_result = await db.execute(
+            select(Signal.sent_email_id).where(
+                Signal.sent_email_id.in_(sent_email_ids),
+                Signal.type.in_([SignalType.REPLY, SignalType.BOUNCE]),
+            ).distinct()
+        )
+        recorded_sent_email_ids = {r[0] for r in recorded_result.all()}
+        threads_to_fetch = [
+            tid for tid, se in thread_to_sent.items()
+            if se.id not in recorded_sent_email_ids
+        ]
+        threads_skipped = len(thread_ids) - len(threads_to_fetch)
+        
         logger.info(
             "Checking threads for replies",
             mailbox=mailbox.email,
             thread_count=len(thread_ids),
+            threads_to_fetch=len(threads_to_fetch),
+            threads_skipped_incremental=threads_skipped,
         )
         
-        # Poll Gmail for replies
+        if not threads_to_fetch:
+            logger.info(
+                "All threads already have recorded signals -- skipping Gmail fetch",
+                mailbox=mailbox.email,
+                threads_skipped=threads_skipped,
+            )
+            return {
+                "signals_detected": 0,
+                "threads_checked": 0,
+                "replies_found": 0,
+                "threads_skipped_incremental": threads_skipped,
+            }
+        
+        # Poll Gmail for replies. Offload the blocking call to a worker thread
+        # (Fix 1) so the event loop stays responsive for the other 9 arq jobs.
+        # Acquire the per-mailbox lock (Fix 2) so two concurrent jobs on the
+        # SAME mailbox cannot interleave httplib2 state on the shared cached
+        # singleton. Different mailboxes have different instances -> different
+        # locks -> stay concurrent.
+        gmail = GmailService.get_inbox(mailbox.email)
         try:
-            gmail = GmailService.get_inbox(mailbox.email)
-            replies = gmail.get_replies_to_threads(thread_ids)
+            replies = await asyncio.to_thread(
+                _gmail_call_locked,
+                gmail,
+                gmail.get_replies_to_threads,
+                threads_to_fetch,
+            )
         except GmailError as e:
             logger.error("Gmail API error", error=str(e))
             return {"error": str(e)}
@@ -206,7 +270,8 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
         
         return {
             "signals_detected": signals_created,
-            "threads_checked": len(thread_ids),
+            "threads_checked": len(threads_to_fetch),
+            "threads_skipped_incremental": threads_skipped,
             "replies_found": len(replies),
         }
 

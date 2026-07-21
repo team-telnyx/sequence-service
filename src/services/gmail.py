@@ -11,6 +11,7 @@ Auth: Service account with domain-wide delegation
 import base64
 import html
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -69,6 +70,13 @@ class GmailService:
         self.inbox = inbox
         self._service = None
         self._credentials = None
+        # Per-instance lock serializing offloaded (asyncio.to_thread) calls.
+        # The underlying googleapiclient service wraps httplib2, which is NOT
+        # thread-safe; two concurrent jobs on the SAME mailbox would share this
+        # cached singleton (cls._instances) and corrupt each other's HTTP state.
+        # Different mailboxes have different instances -> different locks -> stay
+        # concurrent. Same mailbox -> same lock -> serialized.
+        self._lock = threading.Lock()
     
     @property
     def service(self):

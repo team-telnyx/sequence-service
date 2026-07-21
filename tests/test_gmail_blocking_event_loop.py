@@ -39,6 +39,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 
 import pytest
+from sqlalchemy import select
 
 from src.models.models import (
     SequenceEnrollment,
@@ -495,3 +496,300 @@ async def test_send_passes_through_identical_args(seeded, session_factory, monke
     assert "list_unsubscribe" in kwargs
     assert "one_click" in kwargs
     assert "sender_name" in kwargs
+
+
+# ===========================================================================
+# Fix 3 — incremental scan must NOT skip threads whose only recorded Signal
+# is OUT_OF_OFFICE. OOO does not pause/bounce the enrollment, so the contact
+# may still send a genuine human reply later. Skipping on OOO silently
+# reintroduces the REVOPS-972 L3 late-reply failure the 21-day window exists
+# to prevent. Only REPLY/BOUNCE (terminal types) may skip a thread.
+# ===========================================================================
+
+
+async def _seed_one_thread(
+    session_factory, mailbox_id, thread_id="tid-ooo", sent_email_id="sent-ooo"
+):
+    """Seed one SentEmail row so detect_signals has something to poll."""
+    now = datetime.utcnow()
+    async with session_factory() as s:
+        enr = SequenceEnrollment(
+            id="enr-ooo",
+            sequence_id="seq-1",
+            mailbox_id=mailbox_id,
+            contact_email="vp@acme.com",
+            contact_name="VP",
+            timezone="America/New_York",
+            status=EnrollmentStatus.ACTIVE,
+            current_step=1,
+        )
+        s.add(enr)
+        step = SequenceEnrollmentStep(
+            id="estep-ooo",
+            enrollment_id="enr-ooo",
+            step_id="step-1",
+            mailbox_id=mailbox_id,
+            status=EnrollmentStepStatus.SENT,
+            custom_subject="Hi",
+            custom_body="<p>Body</p>",
+        )
+        s.add(step)
+        s.add(
+            SentEmail(
+                id=sent_email_id,
+                message_id=f"mid-{thread_id}",
+                thread_id=thread_id,
+                mailbox_id=mailbox_id,
+                enrollment_step_id="estep-ooo",
+                subject="Hi",
+                body="Body",
+                to_email="vp@acme.com",
+                from_email="quinn.c@telnyx.com",
+                sent_at=now - timedelta(days=1),
+            )
+        )
+        await s.commit()
+
+
+def _gmail_returning(replies_by_call):
+    """Build a stub GmailService whose get_replies_to_threads returns a
+    different payload on each call, drawn from `replies_by_call` (a list of
+    lists). Lets the OOO-then-reply test emit OOO on run 1 and REPLY on run 2
+    on the SAME thread.
+    """
+    state = {"call": 0}
+
+    def _get_replies(thread_ids):
+        idx = state["call"]
+        state["call"] += 1
+        if idx < len(replies_by_call):
+            return replies_by_call[idx]
+        return []
+
+    g = GmailService.__new__(GmailService)
+    g.inbox = "quinn.c@telnyx.com"
+    g._service = MagicMock()
+    g._credentials = None
+    g._lock = threading.Lock()
+    g.get_replies_to_threads = _get_replies
+    return g
+
+
+@pytest.mark.asyncio
+async def test_ooo_then_reply_thread_still_polled_and_pauses_enrollment(
+    seeded, session_factory, monkeypatch
+):
+    """A thread whose only recorded Signal is OUT_OF_OFFICE must NOT be
+    skipped on the next run. The OOO auto-reply does not pause or bounce the
+    enrollment, so the contact may still send a genuine human REPLY days
+    later — and that REPLY must be detected so the enrollment pauses.
+
+    Run 1: Gmail returns an OOO reply for tid-ooo -> Signal(OUT_OF_OFFICE)
+           recorded, enrollment stays ACTIVE, thread must NOT be skipped.
+    Run 2: Gmail returns a genuine REPLY on the same tid-ooo -> it IS
+           detected and the enrollment PAUSES.
+
+    This test FAILS on the current commit (the incremental-scan query has no
+    SignalType filter, so the OOO Signal on run 1 makes run 2 skip tid-ooo
+    and the genuine REPLY is never detected) and PASSES after the fix (the
+    query filters to REPLY/BOUNCE only, so an OOO-only thread stays in
+    threads_to_fetch).
+    """
+    _enable_gmail(monkeypatch)
+    await _seed_one_thread(session_factory, seeded["active_mailbox_id"])
+
+    ooo_reply = [
+        {
+            "message_id": "ooo-1",
+            "thread_id": "tid-ooo",
+            "from": "vp@acme.com",
+            "subject": "Out of office",
+            "date": "Mon, 20 Jul 2026 12:00:00 +0000",
+            "snippet": "I am OOO until Aug 1",
+            "label_ids": ["INBOX"],
+            "is_bounce": False,
+            "is_ooo": True,
+        }
+    ]
+    human_reply = [
+        {
+            "message_id": "reply-1",
+            "thread_id": "tid-ooo",
+            "from": "vp@acme.com",
+            "subject": "Re: Hi",
+            "date": "Wed, 22 Jul 2026 12:00:00 +0000",
+            "snippet": "yes please",
+            "label_ids": ["INBOX"],
+            "is_bounce": False,
+            "is_ooo": False,
+        }
+    ]
+    gmail = _gmail_returning([ooo_reply, human_reply])
+
+    cms = _sd_patches(session_factory, gmail)
+    for c in cms:
+        c.start()
+    try:
+        with patch.object(sd, "create_signal_webhook", new=_async_false):
+            r1 = await sd.detect_signals(
+                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
+            )
+
+            # Read enrollment state BETWEEN runs to prove OOO did NOT pause.
+            async with session_factory() as s:
+                enr_after_ooo = (
+                    await s.execute(
+                        select(SequenceEnrollment).where(
+                            SequenceEnrollment.id == "enr-ooo"
+                        )
+                    )
+                ).scalar_one()
+                assert enr_after_ooo.status == EnrollmentStatus.ACTIVE, (
+                    "OOO must not change enrollment status, but run 1 left it "
+                    f"{enr_after_ooo.status.value}"
+                )
+
+            r2 = await sd.detect_signals(
+                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
+            )
+    finally:
+        for c in cms:
+            c.stop()
+
+    # Run 1: OOO recorded, enrollment still ACTIVE.
+    assert r1["signals_detected"] == 1
+    assert r1["threads_checked"] == 1
+
+    # Run 2: the SAME thread is still in threads_to_fetch (OOO is not
+    # terminal), so the genuine REPLY is detected and the enrollment pauses.
+    assert r2["signals_detected"] == 1, (
+        "run 2 should have detected the genuine REPLY on tid-ooo, but "
+        f"signals_detected={r2['signals_detected']} — the thread was "
+        "skipped by the incremental scan because its only Signal was "
+        "OUT_OF_OFFICE (a non-terminal type). This is the REVOPS-972 L3 "
+        "late-reply failure reintroduced."
+    )
+    assert r2["threads_checked"] == 1, (
+        "tid-ooo must still be fetched on run 2 because its only recorded "
+        f"Signal is OOO; threads_checked={r2['threads_checked']}"
+    )
+
+    async with session_factory() as s:
+        enr = (
+            await s.execute(
+                select(SequenceEnrollment).where(SequenceEnrollment.id == "enr-ooo")
+            )
+        ).scalar_one()
+        assert enr.status == EnrollmentStatus.PAUSED, (
+            "the genuine REPLY on run 2 must have paused the enrollment, "
+            f"but status is {enr.status.value}"
+        )
+        assert enr.pause_reason == "reply"
+
+
+@pytest.mark.asyncio
+async def test_reply_signal_still_skips_thread_on_next_run(
+    seeded, session_factory, monkeypatch
+):
+    """A thread with a recorded REPLY IS skipped on the next run — the
+    intended optimization is preserved. REPLY is terminal (enrollment
+    pauses), so re-fetching would only re-discover the same reply.
+    """
+    _enable_gmail(monkeypatch)
+    await _seed_one_thread(
+        session_factory,
+        seeded["active_mailbox_id"],
+        thread_id="tid-reply",
+        sent_email_id="sent-reply",
+    )
+
+    reply = [
+        {
+            "message_id": "reply-x",
+            "thread_id": "tid-reply",
+            "from": "vp@acme.com",
+            "subject": "Re: Hi",
+            "date": "Mon, 20 Jul 2026 12:00:00 +0000",
+            "snippet": "yes please",
+            "label_ids": ["INBOX"],
+            "is_bounce": False,
+            "is_ooo": False,
+        }
+    ]
+    gmail = _gmail_returning([reply])
+
+    cms = _sd_patches(session_factory, gmail)
+    for c in cms:
+        c.start()
+    try:
+        with patch.object(sd, "create_signal_webhook", new=_async_false):
+            r1 = await sd.detect_signals(
+                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
+            )
+            r2 = await sd.detect_signals(
+                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
+            )
+    finally:
+        for c in cms:
+            c.stop()
+
+    assert r1["signals_detected"] == 1
+    assert r2["signals_detected"] == 0
+    assert r2.get("threads_skipped_incremental") == 1, (
+        "a thread with a recorded REPLY must be skipped on the next run"
+    )
+    assert r2["threads_checked"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bounce_signal_still_skips_thread_on_next_run(
+    seeded, session_factory, monkeypatch
+):
+    """A thread with a recorded BOUNCE IS skipped on the next run — the
+    intended optimization is preserved. BOUNCE is terminal (enrollment
+    bounces), so re-fetching would only re-discover the same bounce.
+    """
+    _enable_gmail(monkeypatch)
+    await _seed_one_thread(
+        session_factory,
+        seeded["active_mailbox_id"],
+        thread_id="tid-bounce",
+        sent_email_id="sent-bounce",
+    )
+
+    bounce = [
+        {
+            "message_id": "bounce-x",
+            "thread_id": "tid-bounce",
+            "from": "mail-daemon@acme.com",
+            "subject": "Delivery Status Notification (Failure)",
+            "date": "Mon, 20 Jul 2026 12:00:00 +0000",
+            "snippet": "Address not found",
+            "label_ids": ["INBOX"],
+            "is_bounce": True,
+            "is_ooo": False,
+        }
+    ]
+    gmail = _gmail_returning([bounce])
+
+    cms = _sd_patches(session_factory, gmail)
+    for c in cms:
+        c.start()
+    try:
+        with patch.object(sd, "create_signal_webhook", new=_async_false):
+            r1 = await sd.detect_signals(
+                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
+            )
+            r2 = await sd.detect_signals(
+                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
+            )
+    finally:
+        for c in cms:
+            c.stop()
+
+    assert r1["signals_detected"] == 1
+    assert r2["signals_detected"] == 0
+    assert r2.get("threads_skipped_incremental") == 1, (
+        "a thread with a recorded BOUNCE must be skipped on the next run"
+    )
+    assert r2["threads_checked"] == 0

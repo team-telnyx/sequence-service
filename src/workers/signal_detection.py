@@ -95,19 +95,23 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
         thread_to_sent = {se.thread_id: se for se in sent_emails if se.thread_id}
         thread_ids = list(thread_to_sent.keys())
         
-        # Incremental scan (Fix 3): skip threads that already have at least one
-        # Signal recorded. A thread with a recorded REPLY/BOUNCE has already
-        # triggered its enrollment-state transition (PAUSED/BOUNCED), so re-
-        # fetching it would only re-discover the same reply and hit the per-
-        # reply dedup below. The 21-day window stays intact -- we bound the
-        # WORK (threads fetched), not the window (cutoff). Live: ~1,300
-        # threads -> ~0 after the first run records replies, vs. 1,300 every
-        # run before. The per-reply Signal.raw_data dedup below stays as a
-        # safety net for threads that ARE fetched.
+        # Incremental scan (Fix 3): skip threads that already have a TERMINAL
+        # signal recorded (REPLY -> enrollment PAUSED, BOUNCE -> BOUNCED).
+        # Re-fetching a terminal-signaled thread would only re-discover the
+        # same reply and hit the per-reply dedup below. Non-terminal signals
+        # (OUT_OF_OFFICE, OPEN, CLICK, UNSUBSCRIBE) do NOT stop the enrollment,
+        # so the contact may still send a genuine human REPLY later -- skipping
+        # on those would silently reintroduce the REVOPS-972 L3 late-reply
+        # failure the 21-day window exists to prevent. The per-reply
+        # Signal.raw_data dedup below stays as a safety net for threads that
+        # ARE fetched. The 21-day window stays intact -- we bound the WORK
+        # (threads fetched), not the window (cutoff). Steady-state fetch set =
+        # "threads still awaiting a terminal outcome," not ~0.
         sent_email_ids = [se.id for se in sent_emails]
         recorded_result = await db.execute(
             select(Signal.sent_email_id).where(
-                Signal.sent_email_id.in_(sent_email_ids)
+                Signal.sent_email_id.in_(sent_email_ids),
+                Signal.type.in_([SignalType.REPLY, SignalType.BOUNCE]),
             ).distinct()
         )
         recorded_sent_email_ids = {r[0] for r in recorded_result.all()}

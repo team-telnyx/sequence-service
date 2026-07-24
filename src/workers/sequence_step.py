@@ -222,7 +222,7 @@ async def process_sequence_step(
         # Send window check — re-queue if outside recipient's business hours
         window_delay = check_send_window(enrollment.timezone)
         if window_delay is not None:
-            logger.info(
+            logger.debug(
                 "Outside send window — re-queuing",
                 enrollment_step_id=enrollment_step_id,
                 delay_seconds=window_delay,
@@ -314,7 +314,7 @@ async def process_sequence_step(
         reserved = await reserve_send(db, mailbox.id)
         if not reserved:
             defer_delay = seconds_until_capacity_reset()
-            logger.info(
+            logger.debug(
                 "Mailbox at capacity — deferring to next daily reset",
                 enrollment_step_id=enrollment_step_id,
                 mailbox_id=mailbox.id,

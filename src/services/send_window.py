@@ -67,7 +67,7 @@ def check_send_window(recipient_timezone: str = "America/New_York") -> int | Non
         next_open += timedelta(days=1)
 
     delay_seconds = int((next_open - now_local).total_seconds())
-    logger.info(
+    logger.debug(
         "Outside send window, deferring",
         recipient_timezone=recipient_timezone,
         current_hour=current_hour,

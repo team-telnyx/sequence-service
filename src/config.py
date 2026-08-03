@@ -17,16 +17,18 @@ from functools import lru_cache
 # legacy naming, not the retired tenant-quinn pool.)
 # =============================================================
 
-SCOUT_MAILBOXES = frozenset({
-    "quinn.c@telnyx.com",
-    "quinn.d@telnyx.com",
-    "quinn.e@telnyx.com",
-    "quinn.f@telnyx.com",
-    "quinn.g@telnyx.com",
-    "quinn.h@telnyx.com",
-    "quinn.i@telnyx.com",
-    "quinn.j@telnyx.com",
-})
+SCOUT_MAILBOXES = frozenset(
+    {
+        "quinn.c@telnyx.com",
+        "quinn.d@telnyx.com",
+        "quinn.e@telnyx.com",
+        "quinn.f@telnyx.com",
+        "quinn.g@telnyx.com",
+        "quinn.h@telnyx.com",
+        "quinn.i@telnyx.com",
+        "quinn.j@telnyx.com",
+    }
+)
 
 # Transitional Scout-only shims. The Quinn pool and the unknown-tenant fallback
 # semantics are GONE — these intentionally resolve to ONLY the Scout pool. They
@@ -42,7 +44,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment."""
 
     # extra='ignore' is REQUIRED (audit L1): plists set env the service does not
-    # read (SCOUT_API_KEY, SEQUENCE_SEND_MODE, GMAIL_MAILBOXES, ...). pydantic
+    # read (SCOUT_API_URL, SEQUENCE_SEND_MODE, GMAIL_MAILBOXES, ...). pydantic
     # defaults to 'forbid', which would reject those and crash startup. NEVER
     # set this to 'forbid'.
     model_config = SettingsConfigDict(
@@ -65,7 +67,9 @@ class Settings(BaseSettings):
     # (maintenance window), not by this change. Domain-wide delegation must be
     # confirmed for quinn.c–quinn.j before flip. Sends delegate per-inbox via
     # gmail's with_subject(self.inbox); there is no single delegated user.
-    gmail_service_account_file: str = "/Users/kevinward/.openclaw-scout/credentials/service-account.json"
+    gmail_service_account_file: str = (
+        "/Users/kevinward/.openclaw-scout/credentials/service-account.json"
+    )
 
     # Tracking
     tracking_enabled: bool = True
@@ -74,7 +78,9 @@ class Settings(BaseSettings):
     # CAN-SPAM / unsubscribe compliance (Wave 0). The visible unsubscribe link +
     # physical postal address are ALWAYS added to every email regardless of
     # tracking_enabled (only the open pixel / click-wrap are gated by tracking).
-    physical_address: str = "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
+    physical_address: str = (
+        "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
+    )
     unsubscribe_mailto: str = "mailto:unsubscribe@telnyx.com?subject=unsubscribe"
     # One-click (RFC 8058) unsubscribe requires a PUBLICLY REACHABLE tracking_base_url
     # serving /track/unsubscribe. Until that host exists, keep this False so we do
@@ -144,8 +150,8 @@ class Settings(BaseSettings):
 
     # Send Window
     send_window_enabled: bool = True
-    send_window_start: int = 8   # 8am
-    send_window_end: int = 17    # 5pm
+    send_window_start: int = 8  # 8am
+    send_window_end: int = 17  # 5pm
 
     # Send Jitter
     send_jitter_enabled: bool = True

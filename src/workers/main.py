@@ -1,6 +1,7 @@
 """ARQ worker configuration and task definitions."""
 
 import asyncio
+import logging
 from arq import create_pool, cron
 from arq.connections import RedisSettings
 import structlog
@@ -14,6 +15,17 @@ from src.workers.signal_detection import detect_signals, detect_signals_all_mail
 from src.workers.webhook_delivery import deliver_webhook
 
 settings = get_settings()
+
+# REVOPS-1425: structlog's default wrapper does NO level filtering, so every
+# debug/info line from every task module reaches the launchd log file
+# (scout-arq-worker.log grew ~250MB/month). Filter at settings.log_level
+# (INFO default) — get_logger() proxies bind lazily, so configuring here
+# still covers loggers already created at import time in the modules above.
+structlog.configure(
+    wrapper_class=structlog.make_filtering_bound_logger(
+        getattr(logging, settings.log_level.upper(), logging.INFO)
+    ),
+)
 logger = structlog.get_logger()
 
 

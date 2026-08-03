@@ -257,7 +257,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                     "allowance": allowance,
                     "reason": reason,
                 }
-                logger.info(
+                logger.debug(
                     "reconcile: mailbox deferred (capacity)",
                     mailbox_id=mailbox_id,
                     spare=spare,

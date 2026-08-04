@@ -2,6 +2,7 @@
 
 import asyncio
 import random
+import re
 import uuid
 from datetime import datetime, timedelta
 
@@ -58,6 +59,21 @@ def _blank_content(subject, body) -> bool:
     email. Treats None / empty / whitespace-only subject OR body as blank.
     """
     return not (subject or "").strip() or not (body or "").strip()
+
+
+def _is_html_body(body: str) -> bool:
+    """True if ``body`` contains structural HTML tags we actually emit.
+
+    REVOPS-1501: step bodies are overwhelmingly plain text (25,877 of 26,000
+    ``sent_emails`` rows). Previously every body was passed to
+    ``build_tracked_email`` with ``is_html=True``, so plain text went verbatim
+    into the HTML MIME part and every mail client collapsed the newlines. A
+    body counts as HTML only if it has an opening ``<p>``, ``<br>``, ``<div>``,
+    ``<a>``, or ``<html>`` tag (followed by ``>``, space, or ``/``); a bare
+    ``<`` in prose (e.g. ``"latency <10ms guaranteed"``) does NOT match because
+    the char after ``<`` is a digit, not one of these tag names.
+    """
+    return bool(re.search(r"<(p|br|div|a|html)[ >/]", body, re.IGNORECASE))
 
 
 async def _defer_step(
@@ -399,12 +415,16 @@ async def process_sequence_step(
         # retryable.
         await db.commit()
 
-        # Build tracked HTML email (with unsubscribe link + CAN-SPAM footer)
-        # Note: step.body contains HTML content (with <p>, <br>, etc.)
+        # Build tracked HTML email (with unsubscribe link + CAN-SPAM footer).
+        # REVOPS-1501: step bodies are plain text (25,877 of 26,000 rows) —
+        # detect HTML structurally instead of assuming it. Plain-text bodies go
+        # through plain_text_to_html (escapes entities, newlines → <br>); genuine
+        # HTML bodies pass through verbatim.
+        is_html = _is_html_body(body)
         html_body, plain_body = build_tracked_email(
             body=body,
             sent_email_id=sent_email_id,
-            is_html=True,  # step.body is HTML
+            is_html=is_html,
             enrollment_id=enrollment.id,
         )
 

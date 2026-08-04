@@ -23,7 +23,6 @@ from src.services.email_builder import build_tracked_email
 from src.api.tracking import generate_unsubscribe_url
 from src.services.gmail import GmailService, GmailError
 from src.services.mailbox_rotation import (
-    select_mailbox,
     reserve_send,
     release_send,
     next_capacity_reset,
@@ -200,7 +199,6 @@ async def process_sequence_step(
             raise ValueError(f"Enrollment step not found: {enrollment_step_id}")
 
         enrollment = enrollment_step.enrollment
-        sequence = enrollment.sequence
         step = enrollment_step.step
 
         # Check enrollment is still active

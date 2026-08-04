@@ -13,7 +13,7 @@ Scope: ``src/workers/sequence_step.py`` + this test module only.
 ``build_tracked_email`` branches are already correct.
 """
 
-from datetime import datetime, timedelta
+import re
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -157,7 +157,7 @@ async def test_plain_body_sent_as_html_with_br_and_footer(
     plain_body_text = (
         "Hey Marc,\n\nShort version: ...\n\n"
         "Want me to put that together?\n\n"
-        "Quinn Taylor\nBusiness Development | Telnyx\ntelnyx.com"
+        "Quinn Taylor\nBusiness Development | Telnyx\nhttps://telnyx.com"
     )
     html_body, plain_body = await _drive_send_with_body(
         session_factory, seeded, monkeypatch, plain_body_text
@@ -171,7 +171,13 @@ async def test_plain_body_sent_as_html_with_br_and_footer(
 
     # Body text present in the HTML part (escaped, not collapsed)
     assert "Hey Marc," in html_body
-    assert "telnyx.com" in html_body
+    # The URL must be autolinked into a real anchor. Uses https:// (the
+    # builder's autolink regex only matches https?://, so a bare-domain
+    # assertion would pass trivially with no anchor). The href is tracking-
+    # wrapped, so match the anchor by its visible text, not the href.
+    assert re.search(r"<a [^>]*>https://telnyx\.com</a>", html_body), (
+        "https://telnyx.com was not autolinked into an anchor in the HTML part"
+    )
 
     # Plain part preserved verbatim + compliance footer appended
     assert "Hey Marc," in plain_body

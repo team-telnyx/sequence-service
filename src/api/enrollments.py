@@ -1,11 +1,12 @@
 """Enrollment management endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, EmailStr, Field, model_validator
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 import uuid
 import structlog
@@ -55,6 +56,14 @@ class EnrollmentCreate(BaseModel):
     # mailbox instead of weighted-random rotation. Invalid/at-capacity/not-active
     # falls back to rotation (logged) — never a hard failure, so sends never stop.
     sender_email: Optional[EmailStr] = None
+    # Optional: caller's policy for the requested sender_email.
+    #   "rotate" (default): on any sender-email fallback, rotate to another
+    #     mailbox — bit-identical to pre-1499 behavior. Never a hard failure.
+    #   "strict": on any sender-email fallback (not_allowed / inactive /
+    #     at_capacity), do NOT rotate — return 409 so the caller can defer and
+    #     retry the same sender instead of silently enrolling onto a different
+    #     region's mailbox (REVOPS-1499). Requires sender_email.
+    sender_policy: Literal["strict", "rotate"] = "rotate"
     # Optional: Scout-composed email content (overrides step template)
     email_subject: Optional[str] = None
     email_body: Optional[str] = None  # HTML content from Scout composition (legacy T1 only)
@@ -71,6 +80,16 @@ class EnrollmentCreate(BaseModel):
         # prospect_id is a caller-friendly alias; external_ref wins if both given.
         if self.external_ref is None and self.prospect_id is not None:
             self.external_ref = self.prospect_id
+        return self
+
+    @model_validator(mode="after")
+    def _strict_policy_requires_sender(self):
+        # strict is meaningless without a requested sender — the caller is
+        # asking for "this sender or nothing" but naming no sender. Surface it
+        # at the schema layer as a 422 rather than letting the request fall
+        # through to rotation (REVOPS-1499).
+        if self.sender_policy == "strict" and self.sender_email is None:
+            raise ValueError("sender_policy='strict' requires sender_email")
         return self
 
 
@@ -184,8 +203,12 @@ async def create_enrollment(
     # If Scout passed a region-routed sender_email, honor it as the sticky
     # sender when it is allowlisted for the tenant, ACTIVE, and has capacity;
     # otherwise fall back to weighted-random rotation (never hard-fail, so a
-    # stale/at-capacity hint can't stop sending).
+    # stale/at-capacity hint can't stop sending). In strict mode (REVOPS-1499)
+    # the fallback is refused — the caller gets a 409 so it can defer/retry the
+    # same sender instead of being silently rotated onto another region.
     mailbox = None
+    strict_reason: Optional[str] = None
+    requested: Optional[str] = None
     if data.sender_email:
         requested = str(data.sender_email).lower()
         allowed = False
@@ -196,6 +219,7 @@ async def create_enrollment(
                 "sender_email not allowed for tenant — falling back to rotation",
                 tenant_id=tenant_id, sender_email=requested, error=str(exc),
             )
+            strict_reason = "not_allowed"
         if allowed:
             result = await db.execute(
                 select(Mailbox).where(
@@ -210,12 +234,14 @@ async def create_enrollment(
                     "sender_email has no ACTIVE mailbox row — falling back to rotation",
                     tenant_id=tenant_id, sender_email=requested,
                 )
+                strict_reason = "inactive"
             elif (candidate.daily_send_limit - candidate.sent_today) < 1:
                 logger.warning(
                     "sender_email mailbox at capacity — falling back to rotation",
                     tenant_id=tenant_id, sender_email=requested,
                     sent_today=candidate.sent_today, daily_send_limit=candidate.daily_send_limit,
                 )
+                strict_reason = "at_capacity"
             else:
                 mailbox = candidate
                 logger.info(
@@ -224,6 +250,30 @@ async def create_enrollment(
                 )
 
     if mailbox is None:
+        if data.sender_policy == "strict":
+            # REVOPS-1499: caller asked for "this sender or nothing". Don't
+            # rotate — return 409 so Scout can defer and retry the same sender
+            # rather than silently enrolling onto a different region's mailbox.
+            # strict_reason is set iff a sender_email fallback was hit; the
+            # no-sender-email-strict case is already rejected at the schema
+            # layer (422), so strict_reason is guaranteed non-None here.
+            logger.warning(
+                "sender_unavailable — strict policy, deferring",
+                tenant_id=tenant_id,
+                error="sender_unavailable",
+                reason=strict_reason,
+                sender_email=requested,
+            )
+            # Return a flat JSON body (no FastAPI `detail` wrapper) so Scout
+            # can read error/reason/sender_email directly off the response.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "sender_unavailable",
+                    "reason": strict_reason,
+                    "sender_email": requested,
+                },
+            )
         mailbox = await select_mailbox(db, tenant_id)
     if not mailbox:
         # Distinguish a TRANSIENT at-capacity condition (every ACTIVE mailbox has

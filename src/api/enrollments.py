@@ -1,6 +1,7 @@
 """Enrollment management endpoints."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -263,9 +264,11 @@ async def create_enrollment(
                 reason=strict_reason,
                 sender_email=requested,
             )
-            raise HTTPException(
+            # Return a flat JSON body (no FastAPI `detail` wrapper) so Scout
+            # can read error/reason/sender_email directly off the response.
+            return JSONResponse(
                 status_code=409,
-                detail={
+                content={
                     "error": "sender_unavailable",
                     "reason": strict_reason,
                     "sender_email": requested,

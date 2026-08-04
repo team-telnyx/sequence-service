@@ -155,10 +155,10 @@ async def test_strict_policy_at_capacity_returns_409_and_no_row(client, seeded, 
         "sender_policy": "strict",
     })
     assert resp.status_code == 409, resp.text
-    detail = resp.json()["detail"]
-    assert detail["error"] == "sender_unavailable"
-    assert detail["reason"] == "at_capacity"
-    assert detail["sender_email"] == seeded["full_mailbox_email"]
+    body = resp.json()
+    assert body["error"] == "sender_unavailable"
+    assert body["reason"] == "at_capacity"
+    assert body["sender_email"] == seeded["full_mailbox_email"]
 
     # No enrollment row was created — strict must defer, not rotate-and-enroll.
     async with session_factory() as db:
@@ -179,10 +179,10 @@ async def test_strict_policy_inactive_returns_409(client, seeded, session_factor
         "sender_policy": "strict",
     })
     assert resp.status_code == 409, resp.text
-    detail = resp.json()["detail"]
-    assert detail["error"] == "sender_unavailable"
-    assert detail["reason"] == "inactive"
-    assert detail["sender_email"] == seeded["paused_mailbox_email"]
+    body = resp.json()
+    assert body["error"] == "sender_unavailable"
+    assert body["reason"] == "inactive"
+    assert body["sender_email"] == seeded["paused_mailbox_email"]
 
 
 @pytest.mark.asyncio
@@ -195,10 +195,10 @@ async def test_strict_policy_not_allowed_returns_409(client, seeded, session_fac
         "sender_policy": "strict",
     })
     assert resp.status_code == 409, resp.text
-    detail = resp.json()["detail"]
-    assert detail["error"] == "sender_unavailable"
-    assert detail["reason"] == "not_allowed"
-    assert detail["sender_email"] == seeded["not_allowed_email"]
+    body = resp.json()
+    assert body["error"] == "sender_unavailable"
+    assert body["reason"] == "not_allowed"
+    assert body["sender_email"] == seeded["not_allowed_email"]
 
 
 @pytest.mark.asyncio

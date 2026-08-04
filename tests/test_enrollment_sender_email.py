@@ -14,6 +14,7 @@ REVOPS-1499 — `sender_policy` strict mode:
   - strict + not_allowed (ValueError path) -> 409 reason=not_allowed
   - strict without sender_email -> 422
   - unknown policy value -> 422
+  - null policy -> 422 (regression pin: null must NOT silently rotate)
   - omitted policy -> rotation fallback still occurs (regression pin)
 """
 
@@ -219,6 +220,20 @@ async def test_unknown_sender_policy_returns_422(client, seeded, session_factory
         "sequence_id": seeded["sequence_id"],
         "contact_email": "strict6@example.com",
         "sender_policy": "bogus",
+    })
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_null_sender_policy_returns_422(client, seeded, session_factory):
+    """Regression pin: sender_policy=null -> 422. Null must NOT be accepted as
+    "use the default" and silently rotate — the caller explicitly passed a
+    value, and that value is invalid for a non-optional field (REVOPS-1499).
+    """
+    resp = await _create(client, seeded["api_key"], {
+        "sequence_id": seeded["sequence_id"],
+        "contact_email": "strict6b@example.com",
+        "sender_policy": None,
     })
     assert resp.status_code == 422, resp.text
 

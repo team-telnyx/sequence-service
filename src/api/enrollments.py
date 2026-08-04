@@ -1,6 +1,6 @@
 """Enrollment management endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,7 +63,7 @@ class EnrollmentCreate(BaseModel):
     #     at_capacity), do NOT rotate — return 409 so the caller can defer and
     #     retry the same sender instead of silently enrolling onto a different
     #     region's mailbox (REVOPS-1499). Requires sender_email.
-    sender_policy: Optional[Literal["strict", "rotate"]] = "rotate"
+    sender_policy: Literal["strict", "rotate"] = "rotate"
     # Optional: Scout-composed email content (overrides step template)
     email_subject: Optional[str] = None
     email_body: Optional[str] = None  # HTML content from Scout composition (legacy T1 only)

@@ -49,6 +49,7 @@ class EnrollmentStepStatus(str, enum.Enum):
     SENT = "SENT"
     SKIPPED = "SKIPPED"
     BOUNCED = "BOUNCED"
+    FAILED = "FAILED"
 
 
 class SignalType(str, enum.Enum):

@@ -523,6 +523,43 @@ async def process_sequence_step(
                 # later) so the two transports behave identically on
                 # permanent failures.
                 if e.retryable:
+                    # r4: the SINGLE choke point for last-attempt terminal
+                    # conversion. ARQ exposes the 1-based attempt in
+                    # ctx['job_try']; max_tries is the shared config
+                    # (settings.worker_max_tries == WorkerSettings.max_tries).
+                    # On the final permitted attempt a retryable error is
+                    # converted to a durable terminal FAILED — the row
+                    # leaves SCHEDULED so the reconciler cannot resurrect it.
+                    # Before r4, exhausted retries left the row SCHEDULED and
+                    # the reconciler re-enqueued it as fresh, so a
+                    # permanently-failing step looped through retry storms
+                    # forever. The marker is already removed and capacity
+                    # already released above; the underlying error is
+                    # preserved in the structured log + the result dict.
+                    # Every retryable path (5xx/429/timeout + r3's
+                    # malformed-202) raises a retryable EmailAPIError caught
+                    # here — one check, not per-site.
+                    job_try = int(ctx.get("job_try", 1))
+                    max_tries = settings.worker_max_tries
+                    if job_try >= max_tries:
+                        enrollment_step.status = EnrollmentStepStatus.FAILED
+                        await db.commit()
+                        logger.error(
+                            "Email API retryable error exhausted max_tries "
+                            "— terminal failure (row -> FAILED)",
+                            job_try=job_try,
+                            max_tries=max_tries,
+                            error=str(e),
+                            enrollment_step_id=enrollment_step_id,
+                            mailbox_id=mailbox.id,
+                        )
+                        return {
+                            "failed": True,
+                            "reason": "max_retries_exhausted",
+                            "error": str(e),
+                            "job_try": job_try,
+                            "max_tries": max_tries,
+                        }
                     defer_s = _compute_retry_defer(e, ctx)
                     # r3: advance scheduled_at so the reconciler's own
                     # predicate (scheduled_at < now - grace) excludes this

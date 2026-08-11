@@ -14,6 +14,7 @@ Hermetic by default — httpx.MockTransport intercepts all HTTP. No live sends.
 """
 
 import os
+import shutil
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -1506,6 +1507,429 @@ class TestRetryAfterDeferRace:
         finally:
             for c in cms2:
                 c.stop()
+
+
+# ── r4 Finding: exhausted retries must not leave the row SCHEDULED ─────────
+
+
+class TestRetryExhaustionTerminal:
+    """r4 Finding: when ARQ retries are exhausted the row must NOT stay
+    SCHEDULED — otherwise the reconciler resurrects a dead job (infinite
+    retry storm). The reviewer proved on real ARQ: after max_tries=3
+    exhaustion the job records JobExecutionFailed but db_status stays
+    SCHEDULED with scheduled_at advanced; once grace passes, reconcile
+    re-enqueues it as fresh.
+
+    Fix (single choke point at the ``if e.retryable:`` branch — the ONLY
+    site that raises ArqRetry, so every retryable path including r3's
+    malformed-202 flows through it): on the LAST permitted attempt
+    (``job_try >= settings.worker_max_tries``) the handler converts the
+    retryable error to a durable terminal failure — row -> FAILED, marker
+    removed, capacity released, underlying error preserved in the
+    structured log + the result dict. Earlier attempts still raise
+    ArqRetry so ARQ re-enqueues with backoff (today's behavior).
+    ``max_tries`` is an explicit Settings field (``worker_max_tries``) read
+    by BOTH WorkerSettings and this check — no magic-literal drift.
+    """
+
+    @pytest.mark.asyncio
+    async def test_last_attempt_503_returns_terminal_failure(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """job_try == max_tries (3) on a 503 → terminal FAILED result, NO
+        ArqRetry raised. Row leaves SCHEDULED so the reconciler cannot
+        resurrect it. Marker removed + capacity released (same cleanup as
+        the retry path)."""
+        from sqlalchemy import select, func
+
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory,
+            seeded,
+            seeded["active_mailbox_id"],
+            step_status=EnrollmentStepStatus.SCHEDULED,
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "worker_max_tries", 3, raising=False)
+
+        release_calls = []
+        original_release = ss.release_send
+
+        async def _tracking_release(db, mailbox_id):
+            release_calls.append(mailbox_id)
+            return await original_release(db, mailbox_id)
+
+        def handler(req):
+            return _resp(
+                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        cms.append(patch.object(ss, "release_send", side_effect=_tracking_release))
+        for c in cms:
+            c.start()
+        try:
+            result = await ss.process_sequence_step(
+                {"job_try": 3}, step_id, seeded["tenant_id"]
+            )
+            # NOT an ArqRetry raise — a terminal failure result dict.
+            assert isinstance(result, dict), (
+                f"last attempt must return a terminal result, not raise; got {type(result)}"
+            )
+            assert result.get("failed") is True, (
+                f"expected terminal failure result, got {result}"
+            )
+            assert result.get("reason") == "max_retries_exhausted", result
+            assert result.get("job_try") == 3, result
+            assert result.get("max_tries") == 3, result
+            # Row left SCHEDULED -> now FAILED (durable terminal, reconciler-proof)
+            async with session_factory() as s:
+                es = await s.get(SequenceEnrollmentStep, step_id)
+                assert es.status == EnrollmentStepStatus.FAILED, (
+                    f"step must be FAILED after exhausting retries, got {es.status}"
+                )
+                count = (
+                    await s.execute(
+                        select(func.count())
+                        .select_from(ss.SentEmail)
+                        .where(ss.SentEmail.enrollment_step_id == step_id)
+                    )
+                ).scalar()
+                assert count == 0, "SentEmail marker not removed on terminal failure"
+            assert seeded["active_mailbox_id"] in release_calls, (
+                "capacity slot not released on terminal failure"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_earlier_attempt_503_raises_arq_retry(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """job_try < max_tries (2 < 3) on a 503 → ArqRetry raised (today's
+        behavior preserved). The retry path is unchanged for non-final
+        attempts — the row stays SCHEDULED so the retry re-sends."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory,
+            seeded,
+            seeded["active_mailbox_id"],
+            step_status=EnrollmentStepStatus.SCHEDULED,
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "worker_max_tries", 3, raising=False)
+
+        def handler(req):
+            return _resp(
+                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry):
+                await ss.process_sequence_step(
+                    {"job_try": 2}, step_id, seeded["tenant_id"]
+                )
+            # Row stays SCHEDULED — still retryable by the next ARQ attempt.
+            async with session_factory() as s:
+                es = await s.get(SequenceEnrollmentStep, step_id)
+                assert es.status == EnrollmentStepStatus.SCHEDULED, (
+                    f"non-final attempt must leave row SCHEDULED for retry, got {es.status}"
+                )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_malformed_202_last_attempt_flows_through_same_choke_point(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """Audit: r3's malformed-202 retryable error on the LAST attempt
+        flows through the SAME choke point (the single ``if e.retryable:``
+        branch) as 5xx/429/timeout — terminal FAILED, no ArqRetry. One
+        choke point, not per-site checks."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory,
+            seeded,
+            seeded["active_mailbox_id"],
+            step_status=EnrollmentStepStatus.SCHEDULED,
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "worker_max_tries", 3, raising=False)
+
+        def handler(req):
+            return _resp(202, json_body={"data": None})  # malformed 202 (r3)
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            result = await ss.process_sequence_step(
+                {"job_try": 3}, step_id, seeded["tenant_id"]
+            )
+            assert isinstance(result, dict) and result.get("failed") is True, (
+                f"malformed-202 on last attempt must return terminal failure, got {result}"
+            )
+            async with session_factory() as s:
+                es = await s.get(SequenceEnrollmentStep, step_id)
+                assert es.status == EnrollmentStepStatus.FAILED, (
+                    f"malformed-202 last attempt must set FAILED, got {es.status}"
+                )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_max_tries_read_from_config_no_literal_drift(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """worker_max_tries is an explicit Settings field; raising it to 5
+        moves the terminal boundary so job_try=3 is now a RETRY (not
+        terminal). Proves the handler reads the config, not a hard-coded 3."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory,
+            seeded,
+            seeded["active_mailbox_id"],
+            step_status=EnrollmentStepStatus.SCHEDULED,
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "worker_max_tries", 5, raising=False)
+
+        def handler(req):
+            return _resp(
+                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            # With max_tries=5, job_try=3 is NOT the last attempt → ArqRetry.
+            with pytest.raises(ArqRetry):
+                await ss.process_sequence_step(
+                    {"job_try": 3}, step_id, seeded["tenant_id"]
+                )
+        finally:
+            for c in cms:
+                c.stop()
+
+
+# ── r4 REAL-ARQ regression: scratch Redis, exhausted retries not resurrected
+
+
+@pytest.mark.skipif(
+    not shutil.which("redis-server"),
+    reason="real-ARQ regression test needs redis-server on PATH",
+)
+class TestRealArqRetryExhaustion:
+    """r4 REAL-ARQ regression — the reviewer's reproduction, as a test.
+
+    Spin up an isolated scratch Redis, enqueue a forever-failing retryable
+    (503) step, drive it through max_tries via a REAL arq Worker in burst
+    mode, then run the reconciler after grace and assert ZERO re-enqueue
+    and the row in its terminal FAILED state. Cleans up scratch resources.
+
+    On b6736c8 (pre-fix) the handler raised ArqRetry on every attempt; ARQ
+    recorded JobExecutionFailed after max_tries and left the row SCHEDULED;
+    the reconciler re-enqueued it as fresh (infinite retry storm). After
+    the r4 fix the handler converts the final attempt to a durable
+    terminal FAILED so the reconciler's predicate (status == SCHEDULED)
+    excludes it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_real_arq_exhausted_retries_not_resurrected(
+        self, seeded, session_factory, monkeypatch
+    ):
+        import asyncio
+        import shutil as _shutil  # noqa: F401  (skipif guard above)
+        import socket
+        import subprocess
+        import time
+
+        from arq import create_pool
+        from arq.connections import RedisSettings
+        from arq.worker import Worker, FailedJobs
+
+        # --- 1. scratch Redis on a random free port ---
+        def _free_port():
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+                sk.bind(("127.0.0.1", 0))
+                return sk.getsockname()[1]
+
+        port = _free_port()
+        proc = subprocess.Popen(
+            [
+                "redis-server",
+                "--port",
+                str(port),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--daemonize",
+                "no",
+                "--loglevel",
+                "warning",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # wait for PING (max 10s)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if (
+                subprocess.call(
+                    ["redis-cli", "-p", str(port), "PING"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                == 0
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            proc.terminate()
+            proc.wait()
+            pytest.skip("could not start scratch redis-server")
+
+        try:
+            # --- 2. seed an email_api step that fails 503 forever ---
+            async with session_factory() as s:
+                mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+                mb.transport = "email_api"
+                await s.commit()
+            step_id = await _make_enrollment_step(
+                session_factory,
+                seeded,
+                seeded["active_mailbox_id"],
+                step_status=EnrollmentStepStatus.SCHEDULED,
+            )
+            monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+            monkeypatch.setattr(ss.settings, "worker_max_tries", 3, raising=False)
+            # tiny grace so the reconciler predicate is exercisable without a
+            # long real-time wait.
+            monkeypatch.setattr(
+                ss.settings, "reconcile_grace_seconds", 1, raising=False
+            )
+
+            def handler(req):
+                return _resp(
+                    503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
+                )
+
+            # Patch the worker's DB session + transport + bypass guards.
+            cms = _worker_patches(session_factory)
+            cms.extend(_real_transport_with_mock_http(handler))
+            for c in cms:
+                c.start()
+
+            # The 503 has no Retry-After → _compute_retry_defer returns 30s
+            # exponential (30/60/120…). That is far too slow for a test. Patch
+            # it to defer ~0.2s so 3 attempts complete in well under a second.
+            # The patched value is INSIDE the r3 cap (grace_seconds=1 * 0.5 =
+            # 0.5) so the scheduled_at advance stays consistent. NB: the call
+            # site is sync (``defer_s = _compute_retry_defer(e, ctx)``, no
+            # await), so the patch MUST be a plain function, not async.
+            def _fast_defer(exc, ctx):
+                return 0.2
+
+            monkeypatch.setattr(ss, "_compute_retry_defer", _fast_defer)
+
+            try:
+                # --- 3. enqueue the job on the real arq pool ---
+                pool = await create_pool(RedisSettings(host="127.0.0.1", port=port))
+                await pool.enqueue_job(
+                    "process_sequence_step", step_id, seeded["tenant_id"]
+                )
+                await pool.close()
+
+                # --- 4. run a REAL arq Worker in burst to drain the queue ---
+                worker = Worker(
+                    functions=[ss.process_sequence_step],
+                    redis_settings=RedisSettings(host="127.0.0.1", port=port),
+                    burst=True,
+                    max_tries=3,
+                    retry_jobs=True,
+                    max_burst_jobs=20,
+                    job_timeout=10,
+                    poll_delay=0.05,
+                    queue_read_limit=10,
+                )
+                try:
+                    await asyncio.wait_for(
+                        worker.run_check(retry_jobs=True, max_burst_jobs=20),
+                        timeout=30,
+                    )
+                except FailedJobs as fj:
+                    pytest.fail(
+                        "ARQ recorded a job failure after max_tries — the "
+                        "handler did NOT convert the final attempt to a "
+                        f"terminal result (the r4 bug). {fj}"
+                    )
+                finally:
+                    await worker.close()
+
+                # --- 5. assert the row is FAILED (durable terminal) ---
+                async with session_factory() as s:
+                    es = await s.get(SequenceEnrollmentStep, step_id)
+                    assert es.status == EnrollmentStepStatus.FAILED, (
+                        f"after max_tries the step must be FAILED (durable "
+                        f"terminal), got {es.status}"
+                    )
+
+                # --- 6. reconciler must NOT re-enqueue a FAILED row ---
+                import src.workers.reconcile as rec
+
+                monkeypatch.setattr(
+                    rec.settings, "reconcile_grace_seconds", 1, raising=False
+                )
+                queue_mock = AsyncMock(return_value="job-reconcile-test")
+                with (
+                    patch.object(rec, "async_session", session_factory),
+                    patch.object(rec, "queue_sequence_step", new=queue_mock),
+                ):
+                    result = await rec.reconcile_scheduled_steps({})
+                assert result["reconciled"] == 0, (
+                    f"reconciler resurrected the FAILED step "
+                    f"(reconciled={result['reconciled']}) — the r4 bug is present"
+                )
+                assert queue_mock.call_count == 0, (
+                    f"reconciler called queue_sequence_step "
+                    f"{queue_mock.call_count} time(s) — FAILED step was "
+                    "resurrected (the r4 bug)"
+                )
+            finally:
+                for c in cms:
+                    c.stop()
+        finally:
+            # --- 7. clean up scratch resources ---
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 # ── live sandbox smoke test (gated, skipped by default) ──────────────────────

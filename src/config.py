@@ -105,6 +105,14 @@ class Settings(BaseSettings):
 
     # Workers
     worker_concurrency: int = 10
+    # REVOPS-1552 r4: single source of truth for the arq retry ceiling.
+    # Both WorkerSettings.max_tries and the last-attempt terminal check in
+    # process_sequence_step read this. If they drift, the worker gives up
+    # after N tries while the handler keeps raising ArqRetry on the Nth —
+    # the row stays SCHEDULED and the reconciler resurrects it (the r4
+    # bug). On the final permitted attempt (job_try >= this) a retryable
+    # error is converted to a durable terminal FAILED, not a Retry.
+    worker_max_tries: int = 3
 
     # Stuck-step reconciler (audit M4): re-enqueue SCHEDULED steps whose arq job
     # was lost. A step is reconciled once it is this many seconds past due (or has

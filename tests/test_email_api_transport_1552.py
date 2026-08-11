@@ -15,7 +15,7 @@ Hermetic by default — httpx.MockTransport intercepts all HTTP. No live sends.
 
 import os
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import httpx
 import pytest
@@ -1129,6 +1129,382 @@ class TestUnknownTransport:
             )
         finally:
             for c in cms:
+                c.stop()
+
+
+# ── r3 Finding 1: malformed 202 success bodies ────────────────────────────────
+
+
+class TestMalformedSuccessBody:
+    """r3 Finding 1: a 202 with a malformed body (missing data.id, missing
+    data.status, or data:null) must NOT be returned as a silent success.
+
+    The Telnyx OpenAPI schema requires data.id and data.status on a 202
+    success. A 202 with a malformed body is a server-side anomaly (the server
+    accepted the message but returned an unusable response) — same class as
+    5xx. The adapter raises EmailAPIRetryableError so the worker raises
+    arq.worker.Retry (the next attempt re-reads the response). Returning
+    message_id=None or status=None as a success would silently lose the send
+    (the caller writes a pending- message_id and never learns the real one).
+    """
+
+    def _make_transport(self):
+        from src.services.email_api import EmailAPITransport
+
+        return EmailAPITransport(
+            api_key="test-key-not-a-secret", base_url="https://api.telnyx.com/v2"
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_202_missing_data_id_raises(self):
+        """202 with data.status but no data.id → EmailAPIRetryableError
+        (not a success with message_id=None)."""
+        from src.services.email_api import EmailAPIRetryableError
+
+        t = self._make_transport()
+        client = _mock_client(
+            lambda r: _resp(202, json_body={"data": {"status": "queued"}})
+        )
+        with pytest.raises(EmailAPIRetryableError) as exc_info:
+            await t.send_html_email(
+                from_email="q@telnyx.com",
+                to="p@acme.com",
+                subject="S",
+                html_body="<p>x</p>",
+                _client=client,
+            )
+        assert exc_info.value.retryable is True
+        assert exc_info.value.status_code == 202
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_malformed_202_missing_data_status_raises(self):
+        """202 with data.id but no data.status → EmailAPIRetryableError
+        (not a success with status=None)."""
+        from src.services.email_api import EmailAPIRetryableError
+
+        t = self._make_transport()
+        client = _mock_client(
+            lambda r: _resp(202, json_body={"data": {"id": "uuid-abc"}})
+        )
+        with pytest.raises(EmailAPIRetryableError) as exc_info:
+            await t.send_html_email(
+                from_email="q@telnyx.com",
+                to="p@acme.com",
+                subject="S",
+                html_body="<p>x</p>",
+                _client=client,
+            )
+        assert exc_info.value.retryable is True
+        assert exc_info.value.status_code == 202
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_malformed_202_data_null_raises(self):
+        """202 with data:null → EmailAPIRetryableError (not a success with
+        both message_id=None and status=None)."""
+        from src.services.email_api import EmailAPIRetryableError
+
+        t = self._make_transport()
+        client = _mock_client(lambda r: _resp(202, json_body={"data": None}))
+        with pytest.raises(EmailAPIRetryableError) as exc_info:
+            await t.send_html_email(
+                from_email="q@telnyx.com",
+                to="p@acme.com",
+                subject="S",
+                html_body="<p>x</p>",
+                _client=client,
+            )
+        assert exc_info.value.retryable is True
+        assert exc_info.value.status_code == 202
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_malformed_202_via_worker_raises_arq_retry(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """Via the worker path, a malformed 202 produces ArqRetry (not a
+        success result, not a terminal RuntimeError). The malformed body is
+        a retryable transport error — the worker re-enqueues with backoff."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        def handler(req):
+            return _resp(202, json_body={"data": None})
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry):
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+        finally:
+            for c in cms:
+                c.stop()
+
+
+# ── r3 Finding 2: long Retry-After vs reconciler grace ───────────────────────
+
+
+class TestRetryAfterDeferRace:
+    """r3 Finding 2: long Retry-After must never defer past the point where
+    the reconciler would re-enqueue the step as "lost".
+
+    The race: worker gets 429 with Retry-After=1200, raises ArqRetry(defer=1200).
+    The step's scheduled_at stays at the original (past) value. The reconciler
+    (grace=900s) sees scheduled_at < now - 900 and re-enqueues a second job.
+    Both jobs fire → double-enqueue (and potential double-send).
+
+    Fix (two complementary mechanisms):
+    1. CAP the defer at reconcile_grace_seconds * retry_defer_grace_fraction
+       (default 0.5) — derived from the same config the reconciler reads. If
+       Retry-After exceeds the cap, defer at the cap and let the next attempt
+       re-read Retry-After.
+    2. ADVANCE enrollment_step.scheduled_at = now + capped_defer when deferring
+       so the reconciler's own predicate (scheduled_at < now - grace) excludes
+       the deferred step — the structural fix that closes the race.
+    """
+
+    @pytest.mark.asyncio
+    async def test_retry_after_above_cap_is_capped(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """Retry-After=1200 with grace=900, fraction=0.5 → cap=450 → defer
+        == 450 (NOT 1200). The next attempt re-reads Retry-After."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
+        monkeypatch.setattr(
+            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
+        )
+
+        def handler(req):
+            return _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+                headers={"Retry-After": "1200"},
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            defer_s = (exc_info.value.defer_score or 0) / 1000
+            assert defer_s == 450, (
+                f"Retry-After=1200 should be capped at 450 (grace=900 * 0.5), "
+                f"got {defer_s}"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_below_cap_honored(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """Retry-After=120 with cap=450 → defer == 120 (honored exactly)."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
+        monkeypatch.setattr(
+            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
+        )
+
+        def handler(req):
+            return _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+                headers={"Retry-After": "120"},
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            defer_s = (exc_info.value.defer_score or 0) / 1000
+            assert defer_s == 120, (
+                f"Retry-After=120 (below cap=450) should be honored exactly, "
+                f"got {defer_s}"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_defer_advances_scheduled_at(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """After a retryable 429 with long Retry-After, scheduled_at is
+        advanced to ~now + capped_defer (not left at the original past value).
+        This is the structural fix: the reconciler keys on
+        scheduled_at < now - grace, so advancing scheduled_at past the cutoff
+        prevents the double-enqueue race."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory,
+            seeded,
+            seeded["active_mailbox_id"],
+            step_status=EnrollmentStepStatus.SCHEDULED,
+        )
+        original_scheduled_at = datetime.utcnow() - timedelta(hours=2)
+        async with session_factory() as s:
+            es = await s.get(SequenceEnrollmentStep, step_id)
+            es.scheduled_at = original_scheduled_at
+            await s.commit()
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
+        monkeypatch.setattr(
+            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
+        )
+
+        def handler(req):
+            return _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+                headers={"Retry-After": "1200"},
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry):
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            async with session_factory() as s:
+                es = await s.get(SequenceEnrollmentStep, step_id)
+                now = datetime.utcnow()
+                assert es.scheduled_at > now, (
+                    f"scheduled_at should be in the future after defer, "
+                    f"got {es.scheduled_at} (now={now})"
+                )
+                assert es.scheduled_at < now + timedelta(seconds=500), (
+                    f"scheduled_at should be ~now+450 (capped defer), "
+                    f"got {es.scheduled_at} (now={now})"
+                )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_reconciler_does_not_double_enqueue_after_defer(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """Reproduce the reviewer's race: worker defers with Retry-After > grace,
+        then run reconciler — assert it does NOT re-enqueue (single enqueue).
+
+        Before the fix: the worker raised ArqRetry(defer=1200) but left
+        scheduled_at at the original past value. The reconciler (grace=900)
+        saw scheduled_at < now - 900 and re-enqueued a second job. Both jobs
+        fired → double-enqueue.
+
+        After the fix: the worker caps the defer at 450 and advances
+        scheduled_at to now + 450. The reconciler's predicate
+        (scheduled_at < now - 900) excludes the deferred step — no re-enqueue.
+        """
+        import src.workers.reconcile as rec
+
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory,
+            seeded,
+            seeded["active_mailbox_id"],
+            step_status=EnrollmentStepStatus.SCHEDULED,
+        )
+        original_scheduled_at = datetime.utcnow() - timedelta(hours=2)
+        async with session_factory() as s:
+            es = await s.get(SequenceEnrollmentStep, step_id)
+            es.scheduled_at = original_scheduled_at
+            await s.commit()
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+        monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
+        monkeypatch.setattr(
+            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
+        )
+        monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 900, raising=False)
+
+        def handler(req):
+            return _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+                headers={"Retry-After": "1200"},
+            )
+
+        # --- Phase 1: worker processes the step and defers ---
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            defer_s = (exc_info.value.defer_score or 0) / 1000
+            assert defer_s == 450, (
+                f"Retry-After=1200 should be capped at 450, got {defer_s}"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+        # --- Phase 2: reconciler runs — should NOT re-enqueue ---
+        queue_mock = AsyncMock(return_value="job-reconcile-test")
+        cms2 = [
+            patch.object(rec, "async_session", session_factory),
+            patch.object(rec, "queue_sequence_step", new=queue_mock),
+        ]
+        for c in cms2:
+            c.start()
+        try:
+            result = await rec.reconcile_scheduled_steps({})
+            assert result["reconciled"] == 0, (
+                f"reconciler should not re-enqueue the deferred step, "
+                f"got reconciled={result['reconciled']}"
+            )
+            assert queue_mock.call_count == 0, (
+                f"reconciler called queue_sequence_step {queue_mock.call_count} "
+                f"time(s) — double-enqueue race not closed"
+            )
+        finally:
+            for c in cms2:
                 c.stop()
 
 

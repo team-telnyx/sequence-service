@@ -111,6 +111,14 @@ class Settings(BaseSettings):
     # no scheduled_at). Kept above the max step jitter so we never race a job that
     # is simply waiting on its defer.
     reconcile_grace_seconds: int = 900
+    # REVOPS-1552 r3: cap the arq Retry defer for a retryable Email API error at
+    # this fraction of the reconciler grace. Without it, a long Retry-After
+    # (e.g. 1200s) would defer the arq job past the grace window (900s), so the
+    # reconciler would see the step as "lost" and re-enqueue a second job —
+    # double-enqueue. The cap is derived from the SAME config the reconciler
+    # reads (reconcile_grace_seconds) so the two stay coupled. See
+    # _compute_retry_defer in sequence_step.py.
+    retry_defer_grace_fraction: float = 0.5
     reconcile_batch_limit: int = 200
     # Per-mailbox capacity pacing (REVOPS-1378 / 2026-07-20 incident): the
     # reconciler previously re-enqueued up to reconcile_batch_limit(200) past-due

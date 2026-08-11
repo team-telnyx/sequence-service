@@ -84,12 +84,24 @@ def _compute_retry_defer(exc, ctx: dict) -> float:
     ``exc.retry_after``) for 429s. Otherwise exponential backoff keyed to the
     arq ``job_try`` counter (1-based): 30s, 60s, 120s, … capped at 600s. The
     base matches the WorkerSettings ``retry_defer_time = 30`` convention.
+
+    r3 (REVOPS-1552): the defer is CAPPED at a safe fraction of the
+    reconciler grace (``reconcile_grace_seconds * retry_defer_grace_fraction``)
+    so a long Retry-After can never defer past the point where the reconciler
+    would re-enqueue the step as "lost". If Retry-After exceeds the cap, defer
+    at the cap and let the next attempt re-read Retry-After. The cap is
+    derived from the same config the reconciler reads — no magic number. The
+    scheduled_at advance in the error handler is the structural half.
     """
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
-        return float(retry_after)
-    job_try = int(ctx.get("job_try", 1))
-    return float(min(30 * 2 ** (job_try - 1), 600))
+        defer = float(retry_after)
+    else:
+        job_try = int(ctx.get("job_try", 1))
+        defer = float(min(30 * 2 ** (job_try - 1), 600))
+    grace_seconds = getattr(settings, "reconcile_grace_seconds", 900)
+    grace_fraction = getattr(settings, "retry_defer_grace_fraction", 0.5)
+    return min(defer, grace_seconds * grace_fraction)
 
 
 async def _defer_step(
@@ -512,6 +524,19 @@ async def process_sequence_step(
                 # permanent failures.
                 if e.retryable:
                     defer_s = _compute_retry_defer(e, ctx)
+                    # r3: advance scheduled_at so the reconciler's own
+                    # predicate (scheduled_at < now - grace) excludes this
+                    # deferred step. Without this, a long Retry-After would
+                    # leave scheduled_at at the original past value while the
+                    # arq job is deferred — the reconciler would see it as
+                    # "lost" and re-enqueue a second job (double-enqueue). The
+                    # cap in _compute_retry_defer bounds the advance so a
+                    # genuinely lost job is still detected within
+                    # cap + grace.
+                    enrollment_step.scheduled_at = datetime.utcnow() + timedelta(
+                        seconds=defer_s
+                    )
+                    await db.commit()
                     logger.info(
                         "Email API retryable error — deferring arq retry",
                         defer_seconds=defer_s,

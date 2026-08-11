@@ -322,7 +322,29 @@ class EmailAPITransport:
 
             if resp.status_code == 202:
                 body = resp.json()
-                data = body.get("data", {}) or {}
+                data = body.get("data")
+                # The Telnyx OpenAPI schema requires data.id and data.status
+                # on a 202 success. A 202 with a malformed body (missing data,
+                # data.id, or data.status) is a server-side anomaly — the
+                # server accepted the message but returned an unusable
+                # response. Treat it as a retryable transport error (same
+                # class as 5xx): the worker raises arq.worker.Retry and the
+                # next attempt re-reads the response. Returning
+                # message_id=None or status=None as a success would silently
+                # lose the send (the caller writes a pending- message_id and
+                # never learns the real Telnyx UUID).
+                if (
+                    not isinstance(data, dict)
+                    or not data.get("id")
+                    or not data.get("status")
+                ):
+                    raise EmailAPIRetryableError(
+                        f"Email API returned 202 but the response body is "
+                        f"malformed — data.id and data.status are required "
+                        f"(OpenAPI schema). Response: {body}",
+                        status_code=resp.status_code,
+                        retryable=True,
+                    )
                 status = data.get("status")
                 msg_id = data.get("id")
                 # send_at guard (b): future send_at must yield status 'scheduled'

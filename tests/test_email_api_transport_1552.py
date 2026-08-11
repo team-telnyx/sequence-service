@@ -15,14 +15,14 @@ Hermetic by default — httpx.MockTransport intercepts all HTTP. No live sends.
 
 import os
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 
 import httpx
 import pytest
+from arq.worker import Retry as ArqRetry
 
 from src.models.models import (
     Mailbox,
-    MailboxStatus,
     SequenceEnrollment,
     SequenceEnrollmentStep,
     EnrollmentStatus,
@@ -39,12 +39,13 @@ def _mock_client(handler, timeout=30.0):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=timeout)
 
 
-def _resp(status_code, json_body=None, text=None):
+def _resp(status_code, json_body=None, text=None, headers=None):
     """Build an httpx.Response."""
     return httpx.Response(
         status_code,
         json=json_body,
         text=text,
+        headers=headers,
         request=httpx.Request("POST", "https://api.telnyx.com/v2/emails"),
     )
 
@@ -59,6 +60,47 @@ def _scheduled_response(msg_id="email-uuid-sched"):
 
 async def _async_false(*a, **k):
     return False
+
+
+# Save the real httpx.AsyncClient BEFORE any patching so the mock-client
+# factory can call it without infinite recursion (P2-B: mock ONLY the HTTP
+# layer, never the transport itself).
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _real_transport_with_mock_http(handler, timeout=30.0):
+    """Return patchers that wire a REAL EmailAPITransport (payload builder +
+    error mapping + send_at guard all run under test) but intercept HTTP via
+    httpx.MockTransport. P2-B: mock ONLY the HTTP layer, not the transport.
+
+    Returns a list of unittest.mock patchers. Start/stop all together::
+
+        patchers = _real_transport_with_mock_http(handler)
+        for p in patchers: p.start()
+        try: ...
+        finally:
+            for p in patchers: p.stop()
+    """
+    from src.services.email_api import EmailAPITransport
+    import src.services.email_api as email_api_mod
+
+    real_transport = EmailAPITransport(
+        api_key="test-key-not-a-secret",
+        base_url="https://api.telnyx.com/v2",
+        timeout=timeout,
+    )
+
+    def _client_factory(*args, **kwargs):
+        t = kwargs.get("timeout", timeout)
+        return _REAL_ASYNC_CLIENT(
+            transport=httpx.MockTransport(handler),
+            timeout=t,
+        )
+
+    return [
+        patch.object(EmailAPITransport, "_instance", real_transport),
+        patch.object(email_api_mod.httpx, "AsyncClient", _client_factory),
+    ]
 
 
 # ── payload builder ──────────────────────────────────────────────────────────
@@ -201,6 +243,31 @@ class TestPayloadBuilder:
         )
         assert "scheduled_at" not in payload
 
+    def test_sandbox_mode_added_to_payload(self):
+        """sandbox_mode=True → payload includes sandbox_mode: True so the API
+        accepts the message but does NOT deliver it (P2-A: safe smoke test)."""
+        t = self._make_transport()
+        payload = t.build_payload(
+            from_email="q@telnyx.com",
+            to="p@acme.com",
+            subject="S",
+            html_body="<p>x</p>",
+            sandbox_mode=True,
+        )
+        assert payload.get("sandbox_mode") is True
+
+    def test_sandbox_mode_off_by_default(self):
+        t = self._make_transport()
+        payload = t.build_payload(
+            from_email="q@telnyx.com",
+            to="p@acme.com",
+            subject="S",
+            html_body="<p>x</p>",
+        )
+        assert "sandbox_mode" not in payload, (
+            "sandbox_mode should be omitted when not explicitly set"
+        )
+
 
 # ── send_at guard matrix ─────────────────────────────────────────────────────
 
@@ -269,8 +336,6 @@ class TestSendAtGuard:
 
     @pytest.mark.asyncio
     async def test_future_send_at_with_scheduled_status_succeeds(self):
-        from src.services.email_api import EmailAPITransport
-
         t = self._make_transport()
         future = datetime.now(timezone.utc) + timedelta(hours=1)
 
@@ -458,6 +523,61 @@ class TestErrorMapping:
             )
         await client.aclose()
 
+    @pytest.mark.asyncio
+    async def test_429_captures_retry_after_header(self):
+        """429 with Retry-After header → EmailAPIReputationError.retry_after
+        is parsed (seconds) so the worker can honor it as the Retry defer."""
+        from src.services.email_api import EmailAPIReputationError
+
+        t = self._make_transport()
+        client = _mock_client(
+            lambda r: _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+                headers={"Retry-After": "120"},
+            )
+        )
+        with pytest.raises(EmailAPIReputationError) as exc_info:
+            await t.send_html_email(
+                from_email="q@telnyx.com",
+                to="p@acme.com",
+                subject="S",
+                html_body="<p>x</p>",
+                _client=client,
+            )
+        assert exc_info.value.retryable is True
+        assert exc_info.value.retry_after == 120, (
+            f"retry_after should be 120 (from Retry-After header), got {exc_info.value.retry_after!r}"
+        )
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_429_no_retry_after_header_is_none(self):
+        """429 without Retry-After → retry_after is None (worker uses exponential)."""
+        from src.services.email_api import EmailAPIReputationError
+
+        t = self._make_transport()
+        client = _mock_client(
+            lambda r: _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+            )
+        )
+        with pytest.raises(EmailAPIReputationError) as exc_info:
+            await t.send_html_email(
+                from_email="q@telnyx.com",
+                to="p@acme.com",
+                subject="S",
+                html_body="<p>x</p>",
+                _client=client,
+            )
+        assert exc_info.value.retry_after is None
+        await client.aclose()
+
 
 # ── config ───────────────────────────────────────────────────────────────────
 
@@ -572,12 +692,17 @@ def _worker_patches(session_factory):
 
 
 class TestTransportSelection:
+    """P2-B: dispatch-path tests mock ONLY the HTTP layer (httpx.MockTransport)
+    so the real EmailAPITransport payload builder + error mapping run under
+    test. The Gmail path still mocks GmailService (Gmail is not the transport
+    under test here)."""
+
     @pytest.mark.asyncio
     async def test_gmail_transport_takes_gmail_path_unchanged(
         self, seeded, session_factory, monkeypatch
     ):
         """transport='gmail' → GmailService.send_html_email called (existing
-        path, byte-identical behavior). EmailAPITransport NOT touched."""
+        path, byte-identical behavior). Email API NOT touched."""
         step_id = await _make_enrollment_step(
             session_factory, seeded, seeded["active_mailbox_id"]
         )
@@ -587,27 +712,21 @@ class TestTransportSelection:
         gmail_inbox.send_html_email = MagicMock(
             return_value={"message_id": "gmail-xyz", "thread_id": "thr-1"}
         )
-        email_api_mock = MagicMock()
-        email_api_mock.send_html_email = AsyncMock(
-            return_value={"message_id": "api-should-not-be-used", "thread_id": None}
-        )
+
+        # HTTP handler that FAILS if the Email API path is taken — proves the
+        # gmail branch was selected.
+        def _email_http_should_not_fire(request):
+            raise AssertionError("Email API HTTP called for a gmail mailbox")
 
         cms = _worker_patches(session_factory)
         cms.append(patch.object(ss.GmailService, "get_inbox", return_value=gmail_inbox))
-        cms.append(
-            patch.object(
-                ss.EmailAPITransport, "get_instance", return_value=email_api_mock
-            )
-        )
+        cms.extend(_real_transport_with_mock_http(_email_http_should_not_fire))
         for c in cms:
             c.start()
         try:
             await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
             assert gmail_inbox.send_html_email.call_count == 1, (
                 "Gmail path not taken for transport=gmail"
-            )
-            assert email_api_mock.send_html_email.await_count == 0, (
-                "Email API was called for a gmail mailbox — selection broken"
             )
         finally:
             for c in cms:
@@ -617,9 +736,8 @@ class TestTransportSelection:
     async def test_email_api_transport_takes_api_path(
         self, seeded, session_factory, monkeypatch
     ):
-        """transport='email_api' → EmailAPITransport.send_html_email called.
-        Gmail NOT touched (even if gmail_enabled=True)."""
-        # Flip the active mailbox to email_api
+        """transport='email_api' → real EmailAPITransport.send_html_email runs
+        (P2-B: only HTTP mocked) and the HTTP POST is made. Gmail NOT touched."""
         async with session_factory() as s:
             mb = await s.get(Mailbox, seeded["active_mailbox_id"])
             mb.transport = "email_api"
@@ -630,28 +748,26 @@ class TestTransportSelection:
         )
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
+        http_calls = []
+
+        def handler(req):
+            http_calls.append(req)
+            return _ok_response(status="queued", msg_id="api-uuid-from-http")
+
         gmail_inbox = MagicMock()
         gmail_inbox.send_html_email = MagicMock(
-            return_value={"message_id": "gmail-should-not-be-used", "thread_id": "t"}
-        )
-        email_api_mock = MagicMock()
-        email_api_mock.send_html_email = AsyncMock(
-            return_value={"message_id": "api-uuid-123", "thread_id": None}
+            side_effect=AssertionError("Gmail called for an email_api mailbox")
         )
 
         cms = _worker_patches(session_factory)
         cms.append(patch.object(ss.GmailService, "get_inbox", return_value=gmail_inbox))
-        cms.append(
-            patch.object(
-                ss.EmailAPITransport, "get_instance", return_value=email_api_mock
-            )
-        )
+        cms.extend(_real_transport_with_mock_http(handler))
         for c in cms:
             c.start()
         try:
             await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
-            assert email_api_mock.send_html_email.await_count == 1, (
-                "Email API path not taken for transport=email_api"
+            assert len(http_calls) == 1, (
+                f"Email API HTTP not called exactly once (got {len(http_calls)})"
             )
             assert gmail_inbox.send_html_email.call_count == 0, (
                 "Gmail was called for an email_api mailbox — selection broken"
@@ -661,73 +777,11 @@ class TestTransportSelection:
                 c.stop()
 
     @pytest.mark.asyncio
-    async def test_email_api_send_failure_clears_marker_and_releases_capacity(
-        self, seeded, session_factory, monkeypatch
-    ):
-        """EmailAPIError must clean up like GmailError: delete the SentEmail
-        marker (retryable) and release the capacity slot."""
-        from src.services.email_api import EmailAPIPermanentError
-        from sqlalchemy import select, func
-
-        async with session_factory() as s:
-            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
-            mb.transport = "email_api"
-            await s.commit()
-
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
-        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
-
-        email_api_mock = MagicMock()
-        email_api_mock.send_html_email = AsyncMock(
-            side_effect=EmailAPIPermanentError("422 bad recipient")
-        )
-
-        # Track release_send calls
-        release_calls = []
-        original_release = ss.release_send
-
-        async def _tracking_release(db, mailbox_id):
-            release_calls.append(mailbox_id)
-            return await original_release(db, mailbox_id)
-
-        cms = _worker_patches(session_factory)
-        cms.append(
-            patch.object(
-                ss.EmailAPITransport, "get_instance", return_value=email_api_mock
-            )
-        )
-        cms.append(patch.object(ss, "release_send", side_effect=_tracking_release))
-        for c in cms:
-            c.start()
-        try:
-            with pytest.raises(Exception):
-                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
-            # SentEmail marker removed → retryable
-            async with session_factory() as s:
-                count = (
-                    await s.execute(
-                        select(func.count())
-                        .select_from(ss.SentEmail)
-                        .where(ss.SentEmail.enrollment_step_id == step_id)
-                    )
-                ).scalar()
-            assert count == 0, "SentEmail marker not removed after EmailAPIError"
-            # capacity released
-            assert seeded["active_mailbox_id"] in release_calls, (
-                "release_send not called after EmailAPIError — capacity slot leaked"
-            )
-        finally:
-            for c in cms:
-                c.stop()
-
-    @pytest.mark.asyncio
     async def test_email_api_send_success_updates_sent_email_message_id(
         self, seeded, session_factory, monkeypatch
     ):
-        """Successful Email API send updates SentEmail.message_id with the
-        Telnyx UUID (replacing the pending- sentinel)."""
+        """Successful Email API send (real transport, HTTP mocked) updates
+        SentEmail.message_id with the Telnyx UUID from the HTTP response."""
         from sqlalchemy import select
 
         async with session_factory() as s:
@@ -740,17 +794,11 @@ class TestTransportSelection:
         )
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
-        email_api_mock = MagicMock()
-        email_api_mock.send_html_email = AsyncMock(
-            return_value={"message_id": "telnyx-uuid-abc", "thread_id": None}
-        )
+        def handler(req):
+            return _ok_response(status="queued", msg_id="telnyx-uuid-abc")
 
         cms = _worker_patches(session_factory)
-        cms.append(
-            patch.object(
-                ss.EmailAPITransport, "get_instance", return_value=email_api_mock
-            )
-        )
+        cms.extend(_real_transport_with_mock_http(handler))
         for c in cms:
             c.start()
         try:
@@ -770,6 +818,320 @@ class TestTransportSelection:
                 c.stop()
 
 
+# ── P1-A: retry semantics — retryable adapter errors → arq.worker.Retry ──────
+
+
+class TestRetrySemantics:
+    """P1-A: retryable adapter errors (429/5xx/timeout) must raise
+    arq.worker.Retry(defer=...) so ARQ actually re-enqueues with backoff.
+    Permanent 4xx stays a terminal RuntimeError (the Gmail contract).
+
+    All tests mock ONLY the HTTP layer (P2-B) so the real payload builder +
+    error mapping + the worker's Retry/RuntimeError dispatch run under test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_429_raises_arq_retry_with_deferral(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """429 → arq.worker.Retry raised with a positive deferral (not
+        RuntimeError). The marker is removed and capacity released so the
+        retry's idempotency pre-check doesn't skip the re-send."""
+        from sqlalchemy import select, func
+
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        release_calls = []
+        original_release = ss.release_send
+
+        async def _tracking_release(db, mailbox_id):
+            release_calls.append(mailbox_id)
+            return await original_release(db, mailbox_id)
+
+        def handler(req):
+            return _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        cms.append(patch.object(ss, "release_send", side_effect=_tracking_release))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            assert exc_info.value.defer_score is not None, (
+                "Retry defer_score is None — no deferral scheduled"
+            )
+            assert exc_info.value.defer_score > 0, (
+                f"Retry defer must be > 0, got {exc_info.value.defer_score}"
+            )
+            # marker removed so the retry re-sends
+            async with session_factory() as s:
+                count = (
+                    await s.execute(
+                        select(func.count())
+                        .select_from(ss.SentEmail)
+                        .where(ss.SentEmail.enrollment_step_id == step_id)
+                    )
+                ).scalar()
+            assert count == 0, "SentEmail marker not removed before Retry"
+            assert seeded["active_mailbox_id"] in release_calls, (
+                "release_send not called before Retry — capacity slot leaked"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_429_honors_retry_after_header(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """429 with Retry-After: 120 → ArqRetry defer == 120s."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        def handler(req):
+            return _resp(
+                429,
+                json_body={
+                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
+                },
+                headers={"Retry-After": "120"},
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            defer_s = (exc_info.value.defer_score or 0) / 1000
+            assert defer_s == 120, (
+                f"Retry defer should honor Retry-After=120s, got {defer_s}s"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_503_raises_arq_retry(self, seeded, session_factory, monkeypatch):
+        """5xx (503) → ArqRetry raised with a positive deferral."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        def handler(req):
+            return _resp(
+                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            assert (exc_info.value.defer_score or 0) > 0
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_arq_retry(self, seeded, session_factory, monkeypatch):
+        """httpx timeout → ArqRetry raised (retryable)."""
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        def handler(req):
+            raise httpx.TimeoutException("simulated timeout")
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler, timeout=0.5))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(ArqRetry) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            assert (exc_info.value.defer_score or 0) > 0
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_400_terminal_failure_no_retry(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """Permanent 4xx (400) → RuntimeError (terminal, NOT ArqRetry). The
+        Gmail-path contract: fail once, let reconcile re-enqueue later.
+        Marker removed + capacity released so the step is retryable by
+        reconcile."""
+        from sqlalchemy import select, func
+
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        release_calls = []
+        original_release = ss.release_send
+
+        async def _tracking_release(db, mailbox_id):
+            release_calls.append(mailbox_id)
+            return await original_release(db, mailbox_id)
+
+        def handler(req):
+            return _resp(
+                400,
+                json_body={"errors": [{"code": "10015", "detail": "bad idempotency"}]},
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        cms.append(patch.object(ss, "release_send", side_effect=_tracking_release))
+        for c in cms:
+            c.start()
+        try:
+            # Must be RuntimeError, NOT ArqRetry
+            with pytest.raises(RuntimeError) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            assert not isinstance(exc_info.value, ArqRetry), (
+                "400 must be terminal (RuntimeError), not ArqRetry"
+            )
+            async with session_factory() as s:
+                count = (
+                    await s.execute(
+                        select(func.count())
+                        .select_from(ss.SentEmail)
+                        .where(ss.SentEmail.enrollment_step_id == step_id)
+                    )
+                ).scalar()
+            assert count == 0, "SentEmail marker not removed after permanent failure"
+            assert seeded["active_mailbox_id"] in release_calls, (
+                "release_send not called after permanent failure — capacity leaked"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+
+# ── P1-B: unknown transport value → terminal config error ──────────────────
+
+
+class TestUnknownTransport:
+    """P1-B: a row with transport='unexpected' must NOT silently fall through
+    to Gmail. Explicit dispatch: email_api / gmail / else → terminal error."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_transport_raises_terminal_error_no_send(
+        self, seeded, session_factory, monkeypatch, engine
+    ):
+        """transport='unexpected' → no send on EITHER transport, terminal error,
+        marker removed + capacity released.
+
+        The DB CHECK constrains SQL writes, but the dispatch must fail safe on
+        anything not exactly 'gmail'/'email_api' (ORM writes on a schema
+        without the CHECK, future values, etc.). We simulate a bad value
+        reaching the dispatch by disabling the CHECK via PRAGMA and writing
+        'unexpected' via raw SQL — the ORM path would reject it."""
+        from sqlalchemy import select, func, text
+
+        async with engine.begin() as conn:
+            await conn.execute(text("PRAGMA ignore_check_constraints = ON"))
+            await conn.execute(
+                text("UPDATE mailboxes SET transport='unexpected' WHERE id=:id"),
+                {"id": seeded["active_mailbox_id"]},
+            )
+
+        step_id = await _make_enrollment_step(
+            session_factory, seeded, seeded["active_mailbox_id"]
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        gmail_inbox = MagicMock()
+        gmail_inbox.send_html_email = MagicMock(
+            side_effect=AssertionError("Gmail called for an unknown transport")
+        )
+
+        def _email_http_should_not_fire(request):
+            raise AssertionError("Email API HTTP called for an unknown transport")
+
+        release_calls = []
+        original_release = ss.release_send
+
+        async def _tracking_release(db, mailbox_id):
+            release_calls.append(mailbox_id)
+            return await original_release(db, mailbox_id)
+
+        cms = _worker_patches(session_factory)
+        cms.append(patch.object(ss.GmailService, "get_inbox", return_value=gmail_inbox))
+        cms.extend(_real_transport_with_mock_http(_email_http_should_not_fire))
+        cms.append(patch.object(ss, "release_send", side_effect=_tracking_release))
+        for c in cms:
+            c.start()
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            assert not isinstance(exc_info.value, ArqRetry), (
+                "unknown transport must be terminal, not a retry"
+            )
+            assert gmail_inbox.send_html_email.call_count == 0
+            async with session_factory() as s:
+                count = (
+                    await s.execute(
+                        select(func.count())
+                        .select_from(ss.SentEmail)
+                        .where(ss.SentEmail.enrollment_step_id == step_id)
+                    )
+                ).scalar()
+            assert count == 0, "SentEmail marker not removed after unknown transport"
+            assert seeded["active_mailbox_id"] in release_calls, (
+                "release_send not called after unknown transport — capacity leaked"
+            )
+        finally:
+            for c in cms:
+                c.stop()
+
+
 # ── live sandbox smoke test (gated, skipped by default) ──────────────────────
 
 
@@ -780,13 +1142,15 @@ class TestTransportSelection:
 class TestLiveSandboxSmoke:
     """Gated live smoke test against the Telnyx Email API sandbox.
 
-    Skipped by default (hermetic CI). To run locally:
+    Skipped by default (hermetic CI). To run locally::
 
         export EMAIL_API_LIVE_SMOKE=1
         export EMAIL_API_KEY=<whitelisted salesops key>
         .venv/bin/python -m pytest tests/test_email_api_transport_1552.py::TestLiveSandboxSmoke -v
 
-    Sends a single sandbox-mode email (sandbox_mode=true) to a test address.
+    P2-A: uses ``sandbox_mode=True`` so the API accepts the message but does NOT
+    deliver it. No ``send_at`` (no scheduled residue to cancel). The response
+    status must be ``"sandbox"`` (per the EmailMessageStatus enum).
     """
 
     @pytest.mark.asyncio
@@ -794,19 +1158,13 @@ class TestLiveSandboxSmoke:
         from src.services.email_api import EmailAPITransport
 
         t = EmailAPITransport()  # reads EMAIL_API_KEY from env
-        # sandbox_mode via headers? No — sandbox_mode is a body field. We don't
-        # expose it on send_html_email yet; this test asserts the transport can
-        # authenticate and reach the API with a minimal payload. Use a future
-        # send_at so no real email leaves until the scheduled time (then we
-        # would cancel — for the smoke test we just assert status 'scheduled').
-        future = datetime.now(timezone.utc) + timedelta(hours=24)
         result = await t.send_html_email(
             from_email=os.environ.get("EMAIL_API_SMOKE_FROM", "quinn.c@telnyx.com"),
             to=os.environ.get("EMAIL_API_SMOKE_TO", "smoke-test@telnyx.com"),
             subject="[SMOKE] sequence-service Email API transport (REVOPS-1552)",
-            html_body="<p>Sandbox smoke test — safe to ignore.</p>",
-            send_at=future,
+            html_body="<p>Sandbox smoke test — safe to ignore. Not delivered.</p>",
+            sandbox_mode=True,
         )
-        assert result["status"] == "scheduled", (
-            f"expected status 'scheduled' for future send_at, got {result['status']!r}"
+        assert result["status"] == "sandbox", (
+            f"expected status 'sandbox' for sandbox_mode=True, got {result['status']!r}"
         )

@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import structlog
+from arq.worker import Retry as ArqRetry
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -74,6 +75,21 @@ def _is_html_body(body: str) -> bool:
     the char after ``<`` is a digit, not one of these tag names.
     """
     return bool(re.search(r"<(p|br|div|a|html)[ >/]", body, re.IGNORECASE))
+
+
+def _compute_retry_defer(exc, ctx: dict) -> float:
+    """Compute the arq Retry defer (seconds) for a retryable EmailAPIError.
+
+    Honors the ``Retry-After`` header (parsed by the adapter into
+    ``exc.retry_after``) for 429s. Otherwise exponential backoff keyed to the
+    arq ``job_try`` counter (1-based): 30s, 60s, 120s, … capped at 600s. The
+    base matches the WorkerSettings ``retry_defer_time = 30`` convention.
+    """
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        return float(retry_after)
+    job_try = int(ctx.get("job_try", 1))
+    return float(min(30 * 2 ** (job_try - 1), 600))
 
 
 async def _defer_step(
@@ -441,12 +457,11 @@ async def process_sequence_step(
             list_unsubscribe = mailto_unsub
 
         # REVOPS-1552: per-mailbox transport selection. The Mailbox.transport
-        # column ('gmail' default | 'email_api') drives the send path. With
-        # 'gmail', behavior is byte-identical to today (the full existing suite
-        # is the contract — no code path changes). With 'email_api', the
-        # Telnyx Email API path is taken. No mailbox can change transport
-        # without an explicit per-mailbox DB flag change (the column is NOT
-        # NULL with server_default 'gmail' + a CHECK constraint).
+        # column ('gmail' default | 'email_api') drives the send path. P1-B:
+        # explicit dispatch — anything not exactly 'gmail'/'email_api' raises a
+        # terminal configuration error (no silent fallthrough to Gmail). The
+        # DB CHECK constrains SQL writes, but ORM writes, SQLite tests, and
+        # future values can bypass it, so the dispatch fails safe.
         if mailbox.transport == "email_api":
             try:
                 transport = EmailAPITransport.get_instance()
@@ -459,13 +474,10 @@ async def process_sequence_step(
                     sender_name=mailbox.display_name,
                     list_unsubscribe=list_unsubscribe,
                     one_click=settings.one_click_unsubscribe_enabled,
-                    # Email-to-Salesforce: SFDC logs a completed Task on the
-                    # matching contact/lead from this BCC copy.
                     bcc=settings.salesforce_bcc_address or None,
                 )
                 api_message_id = result["message_id"]
 
-                # Update sent email with the Telnyx message UUID.
                 sent_email.message_id = api_message_id
                 sent_email.thread_id = result.get("thread_id")
 
@@ -477,87 +489,119 @@ async def process_sequence_step(
                 )
             except EmailAPIError as e:
                 logger.error("Email API send failed", error=str(e))
-                # F3 (at-most-once): a known EmailAPIError means it did NOT
-                # deliver — remove the pre-send marker so the step stays
-                # retryable (otherwise a transient API error would permanently
-                # skip the prospect under the at-most-once pre-check). Hard
-                # crashes (no except) keep the marker → at-most-once.
+                # F3 (at-most-once) + F5 (capacity release): same cleanup for
+                # both terminal and retryable — the marker is removed so the
+                # step is retryable (by arq Retry or by reconcile), and the
+                # capacity slot is returned so a failed attempt doesn't
+                # permanently throttle the mailbox.
                 try:
                     await db.delete(sent_email)
                     await db.commit()
                 except Exception as del_err:
                     logger.warning("Failed to remove send marker", error=str(del_err))
-                # F5: give the reserved capacity slot back so a failed/bounced
-                # attempt doesn't permanently throttle the mailbox.
                 try:
                     await release_send(db, mailbox.id)
-                except Exception as rel_err:  # never mask the original failure
+                except Exception as rel_err:
                     logger.warning("Failed to release send slot", error=str(rel_err))
-                raise RuntimeError(f"Email API send failed: {e}")
-        elif settings.gmail_enabled:
-            # Gmail path (byte-identical to pre-1552 behavior). Offload the
-            # blocking send to a worker thread (Fix 1) so the event loop stays
-            # responsive for the other 9 arq jobs. Acquire the per-mailbox lock
-            # (Fix 2) so two concurrent jobs on the SAME mailbox cannot
-            # interleave httplib2 state on the shared cached GmailService
-            # singleton.
-            try:
-                gmail = GmailService.get_inbox(mailbox.email)
-                result = await asyncio.to_thread(
-                    _gmail_call_locked,
-                    gmail,
-                    gmail.send_html_email,
-                    to=enrollment.contact_email,
-                    subject=subject,
-                    html_body=html_body,
-                    plain_text_fallback=plain_body,
-                    sender_name=mailbox.display_name,
-                    list_unsubscribe=list_unsubscribe,
-                    one_click=settings.one_click_unsubscribe_enabled,
-                    # Email-to-Salesforce: SFDC logs a completed Task on the
-                    # matching contact/lead from this BCC copy.
-                    bcc=settings.salesforce_bcc_address or None,
-                )
-                gmail_message_id = result["message_id"]
-                gmail_thread_id = result["thread_id"]
+                # P1-A: retryable adapter errors (429/5xx/timeout) must raise
+                # arq.worker.Retry so ARQ actually re-enqueues with backoff.
+                # The adapter sets e.retryable=True for those and False for
+                # permanent 4xx. Permanent 4xx keeps the Gmail-path terminal
+                # contract (RuntimeError — fail once, reconcile re-enqueues
+                # later) so the two transports behave identically on
+                # permanent failures.
+                if e.retryable:
+                    defer_s = _compute_retry_defer(e, ctx)
+                    logger.info(
+                        "Email API retryable error — deferring arq retry",
+                        defer_seconds=defer_s,
+                        error=str(e),
+                    )
+                    raise ArqRetry(defer=defer_s) from e
+                raise RuntimeError(f"Email API send failed: {e}") from e
+        elif mailbox.transport == "gmail":
+            if settings.gmail_enabled:
+                # Gmail path (byte-identical to pre-1552 behavior). Offload
+                # the blocking send to a worker thread (Fix 1) so the event
+                # loop stays responsive for the other 9 arq jobs. Acquire the
+                # per-mailbox lock (Fix 2) so two concurrent jobs on the SAME
+                # mailbox cannot interleave httplib2 state on the shared
+                # cached GmailService singleton.
+                try:
+                    gmail = GmailService.get_inbox(mailbox.email)
+                    result = await asyncio.to_thread(
+                        _gmail_call_locked,
+                        gmail,
+                        gmail.send_html_email,
+                        to=enrollment.contact_email,
+                        subject=subject,
+                        html_body=html_body,
+                        plain_text_fallback=plain_body,
+                        sender_name=mailbox.display_name,
+                        list_unsubscribe=list_unsubscribe,
+                        one_click=settings.one_click_unsubscribe_enabled,
+                        bcc=settings.salesforce_bcc_address or None,
+                    )
+                    gmail_message_id = result["message_id"]
+                    gmail_thread_id = result["thread_id"]
 
-                # Update sent email with actual IDs
-                sent_email.message_id = gmail_message_id
-                sent_email.thread_id = gmail_thread_id
+                    sent_email.message_id = gmail_message_id
+                    sent_email.thread_id = gmail_thread_id
 
+                    logger.info(
+                        "Email sent via Gmail (HTML with tracking)",
+                        from_email=mailbox.email,
+                        to_email=enrollment.contact_email,
+                        message_id=gmail_message_id,
+                    )
+                except GmailError as e:
+                    logger.error("Gmail send failed", error=str(e))
+                    try:
+                        await db.delete(sent_email)
+                        await db.commit()
+                    except Exception as del_err:
+                        logger.warning(
+                            "Failed to remove send marker", error=str(del_err)
+                        )
+                    try:
+                        await release_send(db, mailbox.id)
+                    except Exception as rel_err:
+                        logger.warning(
+                            "Failed to release send slot", error=str(rel_err)
+                        )
+                    raise RuntimeError(f"Gmail send failed: {e}")
+            else:
+                # Stub mode - generate fake message ID
+                sent_email.message_id = f"stub-{uuid.uuid4()}"
                 logger.info(
-                    "Email sent via Gmail (HTML with tracking)",
+                    "[STUB] Gmail disabled - skipping actual send",
                     from_email=mailbox.email,
                     to_email=enrollment.contact_email,
-                    message_id=gmail_message_id,
+                    subject=subject,
                 )
-            except GmailError as e:
-                logger.error("Gmail send failed", error=str(e))
-                # F3: a known GmailError means it did NOT deliver — remove the
-                # pre-send marker so the step stays retryable (otherwise a
-                # transient SMTP error would permanently skip the prospect under
-                # the at-most-once pre-check). Hard crashes (no except) keep the
-                # marker → at-most-once.
-                try:
-                    await db.delete(sent_email)
-                    await db.commit()
-                except Exception as del_err:
-                    logger.warning("Failed to remove send marker", error=str(del_err))
-                # F5: the send failed — give the reserved capacity slot back so a
-                # failed/bounced attempt doesn't permanently throttle the mailbox.
-                try:
-                    await release_send(db, mailbox.id)
-                except Exception as rel_err:  # never mask the original failure
-                    logger.warning("Failed to release send slot", error=str(rel_err))
-                raise RuntimeError(f"Gmail send failed: {e}")
         else:
-            # Stub mode - generate fake message ID
-            sent_email.message_id = f"stub-{uuid.uuid4()}"
-            logger.info(
-                "[STUB] Gmail disabled - skipping actual send",
-                from_email=mailbox.email,
-                to_email=enrollment.contact_email,
-                subject=subject,
+            # P1-B: unknown transport value — fail safe. No send on EITHER
+            # transport. The DB CHECK constrains SQL writes, but ORM writes,
+            # SQLite tests, and future values bypass it, so the dispatch must
+            # not silently fall through to Gmail.
+            logger.error(
+                "Unknown mailbox transport — refusing to send",
+                mailbox_id=mailbox.id,
+                transport=mailbox.transport,
+            )
+            try:
+                await db.delete(sent_email)
+                await db.commit()
+            except Exception as del_err:
+                logger.warning("Failed to remove send marker", error=str(del_err))
+            try:
+                await release_send(db, mailbox.id)
+            except Exception as rel_err:
+                logger.warning("Failed to release send slot", error=str(rel_err))
+            raise RuntimeError(
+                f"Unknown mailbox transport {mailbox.transport!r} for "
+                f"mailbox {mailbox.email} — refusing to send. "
+                f"Expected 'gmail' or 'email_api'."
             )
 
         # Update step status

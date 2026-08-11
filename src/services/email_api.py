@@ -107,7 +107,14 @@ class EmailAPIReputationError(EmailAPIError):
     """429 — sending suspended (domain reputation band 'poor').
 
     Retryable with backoff (the reputation band recovers over time).
+    ``retry_after`` is the seconds parsed from the ``Retry-After`` response
+    header (None when the header is absent — the caller falls back to
+    exponential backoff).
     """
+
+    def __init__(self, message, *, retry_after=None, **kwargs):
+        super().__init__(message, **kwargs)
+        self.retry_after = retry_after
 
 
 class EmailAPIConfigError(EmailAPIError):
@@ -196,6 +203,7 @@ class EmailAPITransport:
         list_unsubscribe: Optional[str] = None,
         one_click: bool = False,
         in_reply_to_message_id: Optional[str] = None,
+        sandbox_mode: bool = False,
     ) -> dict:
         """Build the POST /v2/emails request body explicitly — field by field.
 
@@ -203,6 +211,8 @@ class EmailAPITransport:
         NEVER built by passing through an arbitrary dict; only the fields
         listed below are ever sent. ``scheduled_at`` (canonical field name;
         ``send_at`` is a deprecated alias) is used for future scheduling.
+        ``sandbox_mode=True`` accepts the message but does NOT deliver it
+        (used by the gated live smoke test — no scheduled residue to cancel).
         """
         payload: dict = {
             "from": from_email,
@@ -230,6 +240,8 @@ class EmailAPITransport:
             payload["headers"] = headers
         if in_reply_to_message_id:
             payload["in_reply_to_message_id"] = in_reply_to_message_id
+        if sandbox_mode:
+            payload["sandbox_mode"] = True
         return payload
 
     async def send_html_email(
@@ -248,6 +260,7 @@ class EmailAPITransport:
         list_unsubscribe: Optional[str] = None,
         one_click: bool = False,
         in_reply_to_message_id: Optional[str] = None,
+        sandbox_mode: bool = False,
         _client: Optional[httpx.AsyncClient] = None,
     ) -> dict:
         """Send an HTML email via the Telnyx Email API.
@@ -257,6 +270,11 @@ class EmailAPITransport:
         ([] for Gmail-contract compatibility), and ``status``. Mirrors the
         GmailService.send_html_email return shape so the dispatch point can
         treat both transports uniformly.
+
+        ``sandbox_mode=True`` accepts the message at the API but does NOT
+        deliver it — the response status is ``"sandbox"`` (per the
+        EmailMessageStatus enum). Used by the gated live smoke test so there
+        is no scheduled residue to cancel.
 
         ``_client`` is for tests only (inject an httpx.AsyncClient with a
         MockTransport); production leaves it None and a short-lived client is
@@ -281,6 +299,7 @@ class EmailAPITransport:
             list_unsubscribe=list_unsubscribe,
             one_click=one_click,
             in_reply_to_message_id=in_reply_to_message_id,
+            sandbox_mode=sandbox_mode,
         )
 
         url = f"{self.base_url}{EMAILS_PATH}"
@@ -323,11 +342,21 @@ class EmailAPITransport:
                 }
 
             if resp.status_code == 429:
+                # Retry-After is not in the 429 schema but we honor it per
+                # RFC 7231 so the worker can use it as the Retry defer.
+                retry_after = None
+                ra_header = resp.headers.get("Retry-After")
+                if ra_header is not None:
+                    try:
+                        retry_after = float(ra_header)
+                    except ValueError:
+                        retry_after = None
                 raise EmailAPIReputationError(
                     f"Email API 429 — sending suspended (reputation band "
                     f"'poor'): {resp.text}",
                     status_code=429,
                     retryable=True,
+                    retry_after=retry_after,
                 )
             if 400 <= resp.status_code < 500:
                 raise EmailAPIPermanentError(

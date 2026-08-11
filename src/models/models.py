@@ -12,7 +12,6 @@ from sqlalchemy import (
     String,
     Text,
     Integer,
-    Float,
     Boolean,
     Enum,
     UniqueConstraint,

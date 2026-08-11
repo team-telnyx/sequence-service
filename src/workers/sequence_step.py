@@ -22,6 +22,7 @@ from src.models.models import (
 from src.services.email_builder import build_tracked_email
 from src.api.tracking import generate_unsubscribe_url
 from src.services.gmail import GmailService, GmailError
+from src.services.email_api import EmailAPITransport, EmailAPIError
 from src.services.mailbox_rotation import (
     reserve_send,
     release_send,
@@ -439,12 +440,67 @@ async def process_sequence_step(
         else:
             list_unsubscribe = mailto_unsub
 
-        # Send email via Gmail API. Offload the blocking send to a worker thread
-        # (Fix 1) so the event loop stays responsive for the other 9 arq jobs.
-        # Acquire the per-mailbox lock (Fix 2) so two concurrent jobs on the
-        # SAME mailbox cannot interleave httplib2 state on the shared cached
-        # GmailService singleton.
-        if settings.gmail_enabled:
+        # REVOPS-1552: per-mailbox transport selection. The Mailbox.transport
+        # column ('gmail' default | 'email_api') drives the send path. With
+        # 'gmail', behavior is byte-identical to today (the full existing suite
+        # is the contract — no code path changes). With 'email_api', the
+        # Telnyx Email API path is taken. No mailbox can change transport
+        # without an explicit per-mailbox DB flag change (the column is NOT
+        # NULL with server_default 'gmail' + a CHECK constraint).
+        if mailbox.transport == "email_api":
+            try:
+                transport = EmailAPITransport.get_instance()
+                result = await transport.send_html_email(
+                    from_email=mailbox.email,
+                    to=enrollment.contact_email,
+                    subject=subject,
+                    html_body=html_body,
+                    plain_text_fallback=plain_body,
+                    sender_name=mailbox.display_name,
+                    list_unsubscribe=list_unsubscribe,
+                    one_click=settings.one_click_unsubscribe_enabled,
+                    # Email-to-Salesforce: SFDC logs a completed Task on the
+                    # matching contact/lead from this BCC copy.
+                    bcc=settings.salesforce_bcc_address or None,
+                )
+                api_message_id = result["message_id"]
+
+                # Update sent email with the Telnyx message UUID.
+                sent_email.message_id = api_message_id
+                sent_email.thread_id = result.get("thread_id")
+
+                logger.info(
+                    "Email sent via Telnyx Email API (HTML with tracking)",
+                    from_email=mailbox.email,
+                    to_email=enrollment.contact_email,
+                    message_id=api_message_id,
+                )
+            except EmailAPIError as e:
+                logger.error("Email API send failed", error=str(e))
+                # F3 (at-most-once): a known EmailAPIError means it did NOT
+                # deliver — remove the pre-send marker so the step stays
+                # retryable (otherwise a transient API error would permanently
+                # skip the prospect under the at-most-once pre-check). Hard
+                # crashes (no except) keep the marker → at-most-once.
+                try:
+                    await db.delete(sent_email)
+                    await db.commit()
+                except Exception as del_err:
+                    logger.warning("Failed to remove send marker", error=str(del_err))
+                # F5: give the reserved capacity slot back so a failed/bounced
+                # attempt doesn't permanently throttle the mailbox.
+                try:
+                    await release_send(db, mailbox.id)
+                except Exception as rel_err:  # never mask the original failure
+                    logger.warning("Failed to release send slot", error=str(rel_err))
+                raise RuntimeError(f"Email API send failed: {e}")
+        elif settings.gmail_enabled:
+            # Gmail path (byte-identical to pre-1552 behavior). Offload the
+            # blocking send to a worker thread (Fix 1) so the event loop stays
+            # responsive for the other 9 arq jobs. Acquire the per-mailbox lock
+            # (Fix 2) so two concurrent jobs on the SAME mailbox cannot
+            # interleave httplib2 state on the shared cached GmailService
+            # singleton.
             try:
                 gmail = GmailService.get_inbox(mailbox.email)
                 result = await asyncio.to_thread(

@@ -1,8 +1,7 @@
 """ARQ worker configuration and task definitions."""
 
-import asyncio
 import logging
-from arq import create_pool, cron
+from arq import cron
 from arq.connections import RedisSettings
 import structlog
 
@@ -78,8 +77,12 @@ class WorkerSettings:
     max_jobs = settings.worker_concurrency
     job_timeout = 300  # 5 minutes
 
-    # Retry settings
-    max_tries = 3
+    # Retry settings — read from the shared config (src/config.py
+    # worker_max_tries) so the worker's retry ceiling and the handler's
+    # last-attempt terminal check (src/workers/sequence_step.py) never drift.
+    # See the r4 finding: drift here left exhausted-retry rows SCHEDULED for
+    # the reconciler to resurrect.
+    max_tries = settings.worker_max_tries
     retry_defer_time = 30  # Start with 30s delay
 
 

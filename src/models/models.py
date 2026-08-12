@@ -12,7 +12,6 @@ from sqlalchemy import (
     String,
     Text,
     Integer,
-    Float,
     Boolean,
     Enum,
     UniqueConstraint,
@@ -50,6 +49,7 @@ class EnrollmentStepStatus(str, enum.Enum):
     SENT = "SENT"
     SKIPPED = "SKIPPED"
     BOUNCED = "BOUNCED"
+    FAILED = "FAILED"
 
 
 class SignalType(str, enum.Enum):
@@ -87,6 +87,17 @@ class Mailbox(Base):
     weight: Mapped[int] = mapped_column(Integer, default=1)
     daily_send_limit: Mapped[int] = mapped_column(Integer, default=50)
     sent_today: Mapped[int] = mapped_column(Integer, default=0)
+    # REVOPS-1552: per-mailbox transport selection. 'gmail' (default,
+    # byte-identical to today) or 'email_api' (Telnyx Email API). NOT NULL with
+    # server_default 'gmail' so every existing mailbox backfills to the Gmail
+    # path via the migration with zero behavior change. CHECK-constrained to
+    # the two known values so a typo can never silently fall through to a
+    # default branch. The send dispatch in sequence_step.py reads this field
+    # to choose the transport; with 'gmail' the full existing suite is the
+    # contract (byte-identical).
+    transport: Mapped[str] = mapped_column(
+        String(50), default="gmail", server_default="gmail", nullable=False
+    )
     
     # Relationships
     tenant: Mapped["Tenant"] = relationship(back_populates="mailboxes")
@@ -96,6 +107,10 @@ class Mailbox(Base):
     
     __table_args__ = (
         UniqueConstraint("tenant_id", "email", name="uq_mailbox_tenant_email"),
+        CheckConstraint(
+            "transport IN ('gmail', 'email_api')",
+            name="ck_mailbox_transport",
+        ),
     )
 
 

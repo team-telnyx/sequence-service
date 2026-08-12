@@ -12,6 +12,7 @@ Fix: (1) write scheduled_at whenever a step is set SCHEDULED; (2) a cron sweep
 (scheduled_at < now - grace) or have a NULL scheduled_at (legacy stuck rows),
 and pushes scheduled_at forward so an in-flight step isn't re-selected next sweep.
 """
+
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -20,26 +21,48 @@ import pytest
 import src.workers.reconcile as rec
 import src.workers.sequence_step as ss
 from src.models.models import (
-    SequenceEnrollment, SequenceEnrollmentStep,
-    EnrollmentStatus, EnrollmentStepStatus,
+    SequenceEnrollment,
+    SequenceEnrollmentStep,
+    EnrollmentStatus,
+    EnrollmentStepStatus,
 )
 
 
-async def _make_step(session_factory, seeded, *, status, scheduled_at,
-                     step_id="step-1", est_id="estep-1", enr_id="enr-1"):
+async def _make_step(
+    session_factory,
+    seeded,
+    *,
+    status,
+    scheduled_at,
+    step_id="step-1",
+    est_id="estep-1",
+    enr_id="enr-1",
+):
     async with session_factory() as s:
-        s.add(SequenceEnrollment(
-            id=enr_id, sequence_id=seeded["sequence_id"],
-            mailbox_id=seeded["active_mailbox_id"],
-            contact_email=f"vp+{enr_id}@acme.com",  # unique per enrollment
-            contact_name="VP", timezone="America/New_York",
-            status=EnrollmentStatus.ACTIVE, current_step=0,
-        ))
-        s.add(SequenceEnrollmentStep(
-            id=est_id, enrollment_id=enr_id, step_id=step_id,
-            mailbox_id=seeded["active_mailbox_id"], status=status,
-            scheduled_at=scheduled_at, custom_subject="Hi", custom_body="<p>B</p>",
-        ))
+        s.add(
+            SequenceEnrollment(
+                id=enr_id,
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=seeded["active_mailbox_id"],
+                contact_email=f"vp+{enr_id}@acme.com",  # unique per enrollment
+                contact_name="VP",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=0,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id=est_id,
+                enrollment_id=enr_id,
+                step_id=step_id,
+                mailbox_id=seeded["active_mailbox_id"],
+                status=status,
+                scheduled_at=scheduled_at,
+                custom_subject="Hi",
+                custom_body="<p>B</p>",
+            )
+        )
         await s.commit()
     return est_id
 
@@ -69,12 +92,17 @@ def _exit(cms):
 
 # ── reconciler selection ─────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_overdue_scheduled_step_reenqueued(seeded, session_factory, monkeypatch):
     monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
     past = datetime.utcnow() - timedelta(hours=2)
-    est = await _make_step(session_factory, seeded,
-                           status=EnrollmentStepStatus.SCHEDULED, scheduled_at=past)
+    est = await _make_step(
+        session_factory,
+        seeded,
+        status=EnrollmentStepStatus.SCHEDULED,
+        scheduled_at=past,
+    )
     q = AsyncMock(return_value="job-1")
     cms = _patch(session_factory, q)
     _enter(cms)
@@ -96,8 +124,12 @@ async def test_null_scheduled_at_skipped(seeded, session_factory):
     # A NULL scheduled_at is ambiguous under pre-fix data (could be a valid
     # future job). The live reconciler must NOT re-fire it; the one-time backfill
     # computes its intended fire time instead.
-    await _make_step(session_factory, seeded,
-                     status=EnrollmentStepStatus.SCHEDULED, scheduled_at=None)
+    await _make_step(
+        session_factory,
+        seeded,
+        status=EnrollmentStepStatus.SCHEDULED,
+        scheduled_at=None,
+    )
     q = AsyncMock(return_value="job-1")
     cms = _patch(session_factory, q)
     _enter(cms)
@@ -112,8 +144,12 @@ async def test_null_scheduled_at_skipped(seeded, session_factory):
 @pytest.mark.asyncio
 async def test_future_scheduled_step_skipped(seeded, session_factory):
     future = datetime.utcnow() + timedelta(days=2)
-    await _make_step(session_factory, seeded,
-                     status=EnrollmentStepStatus.SCHEDULED, scheduled_at=future)
+    await _make_step(
+        session_factory,
+        seeded,
+        status=EnrollmentStepStatus.SCHEDULED,
+        scheduled_at=future,
+    )
     q = AsyncMock()
     cms = _patch(session_factory, q)
     _enter(cms)
@@ -129,8 +165,12 @@ async def test_future_scheduled_step_skipped(seeded, session_factory):
 async def test_recent_within_grace_skipped(seeded, session_factory, monkeypatch):
     monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
     recent = datetime.utcnow() - timedelta(seconds=120)  # past, but inside 600s grace
-    await _make_step(session_factory, seeded,
-                     status=EnrollmentStepStatus.SCHEDULED, scheduled_at=recent)
+    await _make_step(
+        session_factory,
+        seeded,
+        status=EnrollmentStepStatus.SCHEDULED,
+        scheduled_at=recent,
+    )
     q = AsyncMock()
     cms = _patch(session_factory, q)
     _enter(cms)
@@ -143,14 +183,22 @@ async def test_recent_within_grace_skipped(seeded, session_factory, monkeypatch)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [
-    EnrollmentStepStatus.PENDING,
-    EnrollmentStepStatus.SENT,
-    EnrollmentStepStatus.SKIPPED,
-])
+@pytest.mark.parametrize(
+    "status",
+    [
+        EnrollmentStepStatus.PENDING,
+        EnrollmentStepStatus.SENT,
+        EnrollmentStepStatus.SKIPPED,
+        EnrollmentStepStatus.FAILED,  # r5 REVOPS-1552: durable terminal — reconciler must NOT resurrect a permanent-4xx FAILED row
+    ],
+)
 async def test_non_scheduled_status_ignored(seeded, session_factory, status):
-    await _make_step(session_factory, seeded,
-                     status=status, scheduled_at=datetime.utcnow() - timedelta(hours=2))
+    await _make_step(
+        session_factory,
+        seeded,
+        status=status,
+        scheduled_at=datetime.utcnow() - timedelta(hours=2),
+    )
     q = AsyncMock()
     cms = _patch(session_factory, q)
     _enter(cms)
@@ -171,8 +219,14 @@ async def test_batch_limit_respected(seeded, session_factory, monkeypatch):
     monkeypatch.setattr(rec.settings, "reconcile_pacing_window_hours", 1, raising=False)
     past = datetime.utcnow() - timedelta(hours=2)
     for i in range(5):
-        await _make_step(session_factory, seeded, status=EnrollmentStepStatus.SCHEDULED,
-                         scheduled_at=past, est_id=f"e{i}", enr_id=f"enr{i}")
+        await _make_step(
+            session_factory,
+            seeded,
+            status=EnrollmentStepStatus.SCHEDULED,
+            scheduled_at=past,
+            est_id=f"e{i}",
+            enr_id=f"enr{i}",
+        )
     q = AsyncMock(return_value="j")
     cms = _patch(session_factory, q)
     _enter(cms)
@@ -185,13 +239,21 @@ async def test_batch_limit_respected(seeded, session_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_one_enqueue_failure_does_not_block_others(seeded, session_factory, monkeypatch):
+async def test_one_enqueue_failure_does_not_block_others(
+    seeded, session_factory, monkeypatch
+):
     # Make pacing non-binding so both steps are attempted (allowance >= 2).
     monkeypatch.setattr(rec.settings, "reconcile_pacing_window_hours", 1, raising=False)
     past = datetime.utcnow() - timedelta(hours=2)
     for i in range(2):
-        await _make_step(session_factory, seeded, status=EnrollmentStepStatus.SCHEDULED,
-                         scheduled_at=past, est_id=f"e{i}", enr_id=f"enr{i}")
+        await _make_step(
+            session_factory,
+            seeded,
+            status=EnrollmentStepStatus.SCHEDULED,
+            scheduled_at=past,
+            est_id=f"e{i}",
+            enr_id=f"enr{i}",
+        )
     q = AsyncMock(side_effect=[RuntimeError("redis down"), "job-ok"])
     cms = _patch(session_factory, q)
     _enter(cms)
@@ -206,6 +268,7 @@ async def test_one_enqueue_failure_does_not_block_others(seeded, session_factory
 
 # ── scheduled_at is written when a step is set SCHEDULED ──────────────────────
 
+
 @pytest.mark.asyncio
 async def test_queue_next_step_sets_scheduled_at(seeded, session_factory, monkeypatch):
     # enrollment on step 1 (SENT), step 2 PENDING -> _queue_next_step should
@@ -213,25 +276,37 @@ async def test_queue_next_step_sets_scheduled_at(seeded, session_factory, monkey
     # Disable jitter so scheduled_at is deterministically ~now (step-2 delay = 0).
     monkeypatch.setattr(ss.settings, "send_jitter_enabled", False, raising=False)
     async with session_factory() as s:
-        s.add(SequenceEnrollment(
-            id="enr-1", sequence_id=seeded["sequence_id"],
-            mailbox_id=seeded["active_mailbox_id"], contact_email="vp@acme.com",
-            contact_name="VP", timezone="America/New_York",
-            status=EnrollmentStatus.ACTIVE, current_step=1,
-        ))
-        s.add(SequenceEnrollmentStep(
-            id="es2", enrollment_id="enr-1", step_id="step-2",
-            mailbox_id=seeded["active_mailbox_id"],
-            status=EnrollmentStepStatus.PENDING, scheduled_at=None,
-        ))
+        s.add(
+            SequenceEnrollment(
+                id="enr-1",
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=seeded["active_mailbox_id"],
+                contact_email="vp@acme.com",
+                contact_name="VP",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=1,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="es2",
+                enrollment_id="enr-1",
+                step_id="step-2",
+                mailbox_id=seeded["active_mailbox_id"],
+                status=EnrollmentStepStatus.PENDING,
+                scheduled_at=None,
+            )
+        )
         await s.commit()
 
     q = AsyncMock(return_value="job-x")
     with patch.object(ss, "queue_sequence_step", q):
         async with session_factory() as db:
             enr = await db.get(SequenceEnrollment, "enr-1")
-            await ss._queue_next_step(db, enr, current_step_number=1,
-                                      tenant_id=seeded["tenant_id"])
+            await ss._queue_next_step(
+                db, enr, current_step_number=1, tenant_id=seeded["tenant_id"]
+            )
     status, sched = await _status_and_sched(session_factory, "es2")
     assert status == EnrollmentStepStatus.SCHEDULED
     assert sched is not None

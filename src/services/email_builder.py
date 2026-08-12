@@ -2,7 +2,6 @@
 
 import re
 import html
-from typing import Optional
 
 from src.config import get_settings
 from src.api.tracking import generate_tracking_pixel_url, wrap_link_for_tracking, generate_unsubscribe_url

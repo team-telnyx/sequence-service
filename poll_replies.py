@@ -5,6 +5,7 @@ Reply polling trigger — queues detect_signals arq jobs for all active mailboxe
 Called every 15 minutes by launchd (com.scout.reply-polling).
 This script queues the actual work; the arq worker processes it.
 """
+
 import asyncio
 import os
 import sys
@@ -12,10 +13,13 @@ import logging
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-logger = logging.getLogger('poll_replies')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("poll_replies")
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
+
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 
@@ -25,7 +29,9 @@ async def main():
     from arq.connections import RedisSettings
 
     # Direct DB connection (no SQLAlchemy) to avoid async driver requirement
-    db_url = os.getenv("DATABASE_URL", "postgresql://kevinward@localhost:5432/sequence_service")
+    db_url = os.getenv(
+        "DATABASE_URL", "postgresql://kevinward@localhost:5432/sequence_service"
+    )
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
     gmail_enabled = os.getenv("GMAIL_ENABLED", "false").lower() == "true"
 
@@ -50,9 +56,9 @@ async def main():
 
     for mailbox in mailboxes:
         await redis_pool.enqueue_job(
-            'detect_signals',
-            mailbox_id=str(mailbox['id']),
-            tenant_id=str(mailbox['tenant_id']),
+            "detect_signals",
+            mailbox_id=str(mailbox["id"]),
+            tenant_id=str(mailbox["tenant_id"]),
         )
         queued += 1
         logger.info(f"Queued signal detection for {mailbox['email']}")

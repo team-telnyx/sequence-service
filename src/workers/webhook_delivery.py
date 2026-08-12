@@ -1,6 +1,5 @@
 """Webhook delivery worker."""
 
-import json
 import hashlib
 import hmac
 from datetime import datetime

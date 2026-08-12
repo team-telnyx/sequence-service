@@ -116,7 +116,7 @@ def apply_backfill(cur, skip_older_than_days):
         )
         skipped = cur.rowcount
 
-    print(f"── M4 backfill APPLIED ──────────────────────────────")
+    print("── M4 backfill APPLIED ──────────────────────────────")
     print(f"  scheduled_at backfilled : {backfilled}")
     if skip_older_than_days is not None:
         print(f"  marked SKIPPED (>{skip_older_than_days}d stale) : {skipped}")

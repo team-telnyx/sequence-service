@@ -45,8 +45,6 @@ from src.models.models import (
     SequenceEnrollment,
     SequenceEnrollmentStep,
     SentEmail,
-    Signal,
-    SignalType,
     EnrollmentStatus,
     EnrollmentStepStatus,
 )

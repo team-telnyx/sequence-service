@@ -9,18 +9,47 @@ suppression rows (``API_BOUNCE``/``API_COMPLAINT``/``API_UNSUBSCRIBE``);
 manual/SFDC suppression rows are never modified — one-way sync IN from API
 events only, never write back out.
 
-Deduplication on Telnyx event id (Telnyx redelivers on non-2xx): a
-``ProcessedEmailEvent`` marker is written ONLY after all processing succeeds
-(same transaction), so a partial failure leaves no marker and the redelivery
-retries cleanly. A redelivery hitting an existing marker is a no-op. The
-marker table is opportunistically pruned (rows older than
-``DEDUPE_RETENTION_DAYS`` deleted on each event) so growth is bounded
-without a cron dependency.
+r3 idempotency design (PostgreSQL-native):
 
-The service operates on a normalized ``EmailEvent``, not raw Telnyx JSON —
+  Deduplication on Telnyx event id (Telnyx redelivers on non-2xx) uses
+  ``INSERT ... ON CONFLICT DO NOTHING`` for BOTH the dedupe marker
+  (``ProcessedEmailEvent``, PK on ``id``) AND the suppression insert
+  (unique on ``(tenant_id, email)``). The marker is inserted FIRST in the
+  transaction — rowcount=1 means this request is the winner and proceeds
+  with processing; rowcount=0 means a concurrent request already
+  committed the marker and this request returns 200 duplicate-ok
+  WITHOUT reprocessing. The suppression insert is also idempotent
+  (rowcount=0 → loser, no duplicate row, one-way sync preserved).
+
+  This replaces the r2 broad ``except IntegrityError`` (which mislabeled
+  EVERY integrity failure as a duplicate race — the reviewer's probe
+  swallowed an FK violation: ``propagated=False, rows=0``). With ON
+  CONFLICT DO NOTHING the duplicate-race case is handled structurally
+  by the database, so there is no broad except to mislabel non-duplicate
+  errors. Any ``IntegrityError`` that is NOT the expected duplicate
+  constraint (e.g. FK, NOT NULL) propagates loudly to the caller — no
+  200, no marker committed (the transaction rolls back).
+
+  Dialect note: production runs on PostgreSQL; the test harness uses
+  SQLite (in-memory, aiosqlite). Both support ``ON CONFLICT (cols) DO
+  NOTHING`` (SQLite ≥3.24; Python 3.12 ships SQLite 3.4x+). The
+  dialect-specific ``insert()`` is selected at execute time from the
+  session's bind — ``sqlalchemy.dialects.postgresql.insert`` in
+  production, ``sqlalchemy.dialects.sqlite.insert`` in tests. No
+  exception-based fallback is needed; the only dialects supported are
+  postgresql (production) and sqlite (tests).
+
+  Atomicity: the marker is inserted FIRST in the same transaction as
+  the side effects (suppression, SentEmail.delivered_at, enrollment
+  status). A partial failure (exception) rolls back the marker AND the
+  side effects, so the redelivery retries cleanly — the same atomicity
+  guarantee as the r1/r2 "marker last" design, but with race-resilient
+  winner/loser arbitration via the idempotent insert.
+
+The service operates on a normalized ``EmailEvent``, not raw Telnyx JSON—
 the API layer (``src/api/email_events.py``) parses the raw payload and
-constructs the ``EmailEvent``. This keeps the business logic independent of
-the exact Telnyx webhook envelope structure.
+constructs the ``EmailEvent``. This keeps the business logic independent
+of the exact Telnyx webhook envelope structure.
 """
 
 from __future__ import annotations
@@ -32,7 +61,6 @@ from typing import Optional
 
 import structlog
 from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -79,13 +107,25 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
 
     Returns a dict describing the outcome:
       - ``{"already_processed": True}`` — redelivery of a previously
-        processed event (idempotent no-op).
+        processed event (idempotent no-op), OR this request lost the
+        marker race to a concurrent request (``duplicate_race: True``).
       - ``{"unmatched": True, ...}`` — no ``SentEmail`` row matches the
         event's ``message_id`` (or the enrollment chain is incomplete).
         The marker is still written to prevent reprocessing on redelivery.
       - ``{"processed": True, ...}`` — the event was processed (suppression
         written and/or step/enrollment outcome updated).
+
+    r3 race handling: the marker is inserted FIRST via
+    ``INSERT ... ON CONFLICT (id) DO NOTHING``. If a concurrent request
+    already committed the same marker, this request's insert returns
+    rowcount=0 and this request returns ``already_processed`` WITHOUT
+    reprocessing (no side effects, no duplicate suppression). This is
+    the winner/loser arbitration point — the database is the source of
+    truth, not a try/except.
     """
+    # Fast path: marker already exists from a previously committed event.
+    # This SELECT is an optimization to avoid the INSERT round-trip in the
+    # common case of a redelivery arriving after the marker is committed.
     existing = await db.execute(
         select(ProcessedEmailEvent.id).where(ProcessedEmailEvent.id == event.event_id)
     )
@@ -96,6 +136,29 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
         )
         return {"already_processed": True, "event_id": event.event_id}
 
+    # r3: race-aware marker insert — atomic winner/loser arbitration.
+    # INSERT ... ON CONFLICT (id) DO NOTHING returns rowcount=0 if a
+    # concurrent request just committed the same marker; we lose and
+    # return 200 duplicate-ok without reprocessing. This is the structural
+    # fix for the r2 finding where the loser caught the suppression
+    # unique-violation but then hit an UNCAUGHT duplicate-key on the marker
+    # ORM autoflush at commit time.
+    marker_inserted = await _idempotent_insert_marker(db, event)
+    if marker_inserted == 0:
+        logger.info(
+            "Email event marker lost the race — concurrent request already processed",
+            event_id=event.event_id,
+        )
+        return {
+            "already_processed": True,
+            "event_id": event.event_id,
+            "duplicate_race": True,
+        }
+
+    # We won the marker race — proceed with processing. The marker is
+    # in the current transaction; a partial failure (exception) rolls
+    # back the marker AND any side effects, so the redelivery retries
+    # cleanly (same atomicity guarantee as r1/r2 marker-last).
     result = await db.execute(
         select(SentEmail)
         .where(SentEmail.message_id == event.message_id)
@@ -114,7 +177,6 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
             event_type=event.event_type,
             message_id=event.message_id,
         )
-        _write_marker(db, event)
         await _prune_dedupe(db)
         await db.commit()
         return {"unmatched": True, "event_id": event.event_id}
@@ -131,7 +193,6 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
             message_id=event.message_id,
             enrollment_step_id=enrollment_step.id if enrollment_step else None,
         )
-        _write_marker(db, event)
         await _prune_dedupe(db)
         await db.commit()
         return {
@@ -189,7 +250,6 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
             event_type=event.event_type,
         )
 
-    _write_marker(db, event)
     await _prune_dedupe(db)
     await db.commit()
 
@@ -222,15 +282,27 @@ async def _write_suppression(
     enrollment_id: str,
     event: EmailEvent,
 ) -> None:
-    """Insert an origin-split suppression row (one-way IN, never modify).
+    """Insert an origin-split suppression row idempotently (r3).
 
-    If the email is already suppressed (any reason — manual, reply, or a
-    prior API event), skip the insert: the first suppression stands and is
-    never modified. A race-induced unique violation on (tenant_id, email)
-    is caught and treated as "already suppressed" — both concurrent requests
-    return 200, exactly one row survives (the unique constraint is the
-    durable guard).
+    Uses ``INSERT ... ON CONFLICT (tenant_id, email) DO NOTHING``. The
+    first suppression stands and is never modified (one-way sync). A
+    concurrent insert that loses the race returns rowcount=0 and is a
+    no-op — both concurrent requests return 200, exactly one row
+    survives (the unique constraint is the durable guard).
+
+    r3 change: the r2 broad ``except IntegrityError`` is REMOVED. The
+    duplicate-race case is handled structurally by ON CONFLICT DO NOTHING
+    (rowcount=0), so there is no exception path to mislabel. Any
+    ``IntegrityError`` that is NOT the expected duplicate constraint
+    (e.g. FK violation on ``tenant_id`` or ``source_enrollment_id``,
+    NOT NULL violation) propagates loudly to the caller — no 200, no
+    marker committed. This fixes the r2 Finding 2 (P1) where the broad
+    except swallowed an FK violation (reviewer probe:
+    ``propagated=False, rows=0``).
     """
+    # Fast path: suppression already exists (committed by any prior
+    # request or operator/SFDC). Skip the INSERT round-trip. The existing
+    # row is never modified — one-way sync.
     if await _suppression_exists(db, tenant_id, email):
         logger.info(
             "Suppression already exists — one-way sync, not modified",
@@ -239,20 +311,20 @@ async def _write_suppression(
         )
         return
 
-    suppression = Suppression(
-        id=str(uuid.uuid4()),
+    # Idempotent INSERT — race-aware. Loser of a concurrent insert gets
+    # rowcount=0; the existing row (from any origin) is never modified.
+    # No try/except: a non-duplicate IntegrityError (FK, NOT NULL)
+    # propagates loudly.
+    rowcount = await _idempotent_insert_suppression(
+        db,
         tenant_id=tenant_id,
         email=email,
         domain=domain,
         reason=reason,
-        source_enrollment_id=enrollment_id,
-        notes=f"email_api_{event.event_type} event_id={event.event_id}",
+        enrollment_id=enrollment_id,
+        event=event,
     )
-    try:
-        async with db.begin_nested():
-            db.add(suppression)
-            await db.flush()
-    except IntegrityError:
+    if rowcount == 0:
         logger.info(
             "Suppression insert lost the race — already suppressed by a concurrent event",
             event_id=event.event_id,
@@ -268,14 +340,111 @@ async def _write_suppression(
     )
 
 
-def _write_marker(db: AsyncSession, event: EmailEvent) -> None:
-    """Record the dedupe marker for this event id."""
-    db.add(
-        ProcessedEmailEvent(
-            id=event.event_id,
-            event_type=event.event_type,
-            processed_at=datetime.utcnow(),
+async def _idempotent_insert_suppression(
+    db: AsyncSession,
+    *,
+    tenant_id: str,
+    email: str,
+    domain: Optional[str],
+    reason: SuppressionReason,
+    enrollment_id: str,
+    event: EmailEvent,
+) -> int:
+    """INSERT ... ON CONFLICT (tenant_id, email) DO NOTHING for Suppression.
+
+    Returns 1 if inserted (this request is the suppression origin), 0 if
+    a concurrent request already inserted (or a manual/SFDC row exists)
+    — the existing row is never modified.
+
+    Production: PostgreSQL ``sqlalchemy.dialects.postgresql.insert``.
+    Test infra: SQLite ``sqlalchemy.dialects.sqlite.insert`` (≥3.24).
+    The dialect is detected from the session's bind at execute time.
+    """
+    values = {
+        "id": str(uuid.uuid4()),
+        "tenant_id": tenant_id,
+        "email": email,
+        "domain": domain,
+        "reason": reason,
+        "source_enrollment_id": enrollment_id,
+        "notes": f"email_api_{event.event_type} event_id={event.event_id}",
+    }
+    stmt = _build_idempotent_insert(
+        db,
+        Suppression,
+        values,
+        conflict_index_elements=["tenant_id", "email"],
+    )
+    result = await db.execute(stmt)
+    return result.rowcount
+
+
+async def _idempotent_insert_marker(db: AsyncSession, event: EmailEvent) -> int:
+    """INSERT ... ON CONFLICT (id) DO NOTHING for ProcessedEmailEvent marker.
+
+    Returns 1 if inserted (this request is the winner and proceeds with
+    processing), 0 if a concurrent request already committed the same
+    event_id marker (this request is the loser and returns 200
+    already-processed without reprocessing).
+
+    Production: PostgreSQL. Test infra: SQLite. Both support
+    ON CONFLICT (id) DO NOTHING.
+    """
+    values = {
+        "id": event.event_id,
+        "event_type": event.event_type,
+    }
+    stmt = _build_idempotent_insert(
+        db,
+        ProcessedEmailEvent,
+        values,
+        conflict_index_elements=["id"],
+    )
+    result = await db.execute(stmt)
+    return result.rowcount
+
+
+def _build_idempotent_insert(
+    db: AsyncSession,
+    model,
+    values: dict,
+    *,
+    conflict_index_elements: list[str],
+):
+    """Build a dialect-aware INSERT ... ON CONFLICT DO NOTHING statement.
+
+    Production runs on PostgreSQL; the test harness uses SQLite. Both
+    support ``ON CONFLICT (cols) DO NOTHING`` (SQLite ≥3.24; Python 3.12
+    bundles SQLite 3.4x+). The dialect-specific ``insert()`` is selected
+    at execute time from the session's bind:
+
+      - ``postgresql`` → ``sqlalchemy.dialects.postgresql.insert`` (prod)
+      - ``sqlite``     → ``sqlalchemy.dialects.sqlite.insert``     (tests)
+
+    No exception-based fallback: the only supported dialects are
+    postgresql (production) and sqlite (tests). Any other dialect raises
+    ``RuntimeError`` — fail loud rather than silently degrading.
+    """
+    dialect_name = db.bind.dialect.name
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        return (
+            pg_insert(model)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=conflict_index_elements)
         )
+    if dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        return (
+            sqlite_insert(model)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=conflict_index_elements)
+        )
+    raise RuntimeError(
+        f"Unsupported dialect for idempotent insert: {dialect_name} "
+        "(production expects postgresql, test infra expects sqlite)"
     )
 
 

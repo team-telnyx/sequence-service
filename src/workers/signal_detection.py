@@ -3,7 +3,6 @@
 import asyncio
 import json
 from datetime import datetime, timedelta
-from typing import Optional
 import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -15,7 +14,6 @@ from src.models.models import (
     SentEmail,
     Signal,
     SignalType,
-    SequenceEnrollment,
     SequenceEnrollmentStep,
     EnrollmentStatus,
     EnrollmentStepStatus,

@@ -712,3 +712,218 @@ class TestMalformedPayload:
         sig, ts = _sign(body)
         resp = await _post_signed(client, body, sig, ts)
         assert resp.status_code == 400
+
+
+# ── r2: API suppressions are email-scoped (F1) ──────────────────────────────
+
+
+class TestApiSuppressionIsEmailScoped:
+    """Finding 1 (r2 P1): API-event suppressions must be EMAIL-scoped only.
+
+    A bounce for a@storm.test must NOT suppress unrelated@storm.test. The
+    guard's domain semantics are NOT changed — a manual domain row still
+    blocks domain-wide.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bounce_does_not_suppress_unrelated_same_domain(
+        self, client, session_factory, seeded, monkeypatch
+    ):
+        from src.services.suppression import check_suppressed
+
+        _set_webhook_key(monkeypatch)
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-dom-scope",
+            contact_email="a@storm.test",
+        )
+
+        body = _build_event_body(
+            event_type="email.bounced",
+            event_id="evt-dom-scope",
+            message_id="msg-dom-scope",
+            to_email="a@storm.test",
+        )
+        sig, ts = _sign(body)
+        resp = await _post_signed(client, body, sig, ts)
+        assert resp.status_code == 200
+
+        async with session_factory() as s:
+            assert (
+                await check_suppressed(s, "a@storm.test", seeded["tenant_id"]) is True
+            ), "bounce target must be suppressed"
+            assert (
+                await check_suppressed(s, "unrelated@storm.test", seeded["tenant_id"])
+                is False
+            ), "API bounce must not suppress unrelated contacts at the same domain"
+
+    @pytest.mark.asyncio
+    async def test_manual_domain_suppression_still_blocks_domain_wide(
+        self, session_factory, seeded
+    ):
+        """Finding 1: intentional manual domain row still blocks domain-wide
+        (the guard's domain semantics are NOT changed by the r2 fix)."""
+        from src.services.suppression import check_suppressed
+
+        async with session_factory() as s:
+            s.add(
+                Suppression(
+                    id="sup-dom-manual",
+                    tenant_id=seeded["tenant_id"],
+                    email="domainblock@storm.test",
+                    domain="storm.test",
+                    reason=SuppressionReason.MANUAL,
+                    notes="intentional domain-wide block",
+                )
+            )
+            await s.commit()
+
+        async with session_factory() as s:
+            assert (
+                await check_suppressed(s, "anyone@storm.test", seeded["tenant_id"])
+                is True
+            )
+            assert (
+                await check_suppressed(s, "other@storm.test", seeded["tenant_id"])
+                is True
+            )
+
+
+# ── r2: concurrent redelivery race (F3) ─────────────────────────────────────
+
+
+class TestConcurrentRedeliveryRace:
+    """Finding 3 (r2 P2): a unique-violation on the suppression insert (two
+    concurrent bounce events for the same email) is caught and treated as
+    'already suppressed' — both requests 200. The marker is still written
+    and the enrollment is still marked BOUNCED.
+    """
+
+    @pytest.mark.asyncio
+    async def test_suppression_unique_violation_caught(self, session_factory, seeded):
+        from src.services.email_events import (
+            EVENT_BOUNCE,
+            EmailEvent,
+            process_email_event,
+        )
+
+        ids = await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-race-svc",
+            contact_email="racer@storm.test",
+        )
+
+        # Pre-add a Suppression in the session with autoflush OFF — the
+        # service's existing-check SELECT won't see it, but the flush will
+        # hit the (tenant_id, email) unique constraint — simulating a
+        # concurrent insert that won the race between our check and flush.
+        async with session_factory() as s:
+            s.autoflush = False
+            s.add(
+                Suppression(
+                    id="sup-race-pending",
+                    tenant_id=seeded["tenant_id"],
+                    email="racer@storm.test",
+                    domain=None,
+                    reason=SuppressionReason.API_BOUNCE,
+                    source_enrollment_id=ids["enrollment_id"],
+                    notes="race winner (pending in session)",
+                )
+            )
+
+            event = EmailEvent(
+                event_id="evt-race-svc",
+                event_type=EVENT_BOUNCE,
+                message_id="msg-race-svc",
+                to_email="racer@storm.test",
+            )
+            # On 7dc3303: raises IntegrityError (uncaught). After r2 fix:
+            # catches it, rolls back, writes marker, commits.
+            result = await process_email_event(s, event)
+            assert result["processed"] is True
+
+        # Marker was written (processing completed despite the race)
+        async with session_factory() as s:
+            marker = (
+                await s.execute(
+                    select(ProcessedEmailEvent).where(
+                        ProcessedEmailEvent.id == "evt-race-svc"
+                    )
+                )
+            ).scalar_one_or_none()
+            assert marker is not None, (
+                "marker must be written even after suppression race"
+            )
+
+            enr = await s.get(SequenceEnrollment, ids["enrollment_id"])
+            assert enr.status == EnrollmentStatus.BOUNCED, (
+                "enrollment must still be marked BOUNCED after race-handled suppression"
+            )
+
+
+# ── r2: durable delivered_at (F4) ───────────────────────────────────────────
+
+
+class TestDeliveredDurability:
+    """Finding 4 (r2 P2): delivered events persist a durable delivered_at
+    timestamp on SentEmail. No suppression, no enrollment status change.
+    Idempotent on redelivery (marker catches it).
+    """
+
+    @pytest.mark.asyncio
+    async def test_delivered_event_sets_delivered_at(
+        self, client, session_factory, seeded, monkeypatch
+    ):
+        _set_webhook_key(monkeypatch)
+        await _seed_sent_email(session_factory, seeded, message_id="msg-delivered-at")
+
+        body = _build_event_body(
+            event_type="email.delivered",
+            event_id="evt-delivered-at",
+            message_id="msg-delivered-at",
+        )
+        sig, ts = _sign(body)
+        resp = await _post_signed(client, body, sig, ts)
+        assert resp.status_code == 200
+
+        async with session_factory() as s:
+            sent = await s.get(SentEmail, "sent-estep-webhook")
+            assert sent.delivered_at is not None, "delivered_at must be set"
+            assert len((await s.execute(select(Suppression))).scalars().all()) == 0
+            enr = await s.get(SequenceEnrollment, "enr-webhook")
+            assert enr.status == EnrollmentStatus.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_delivered_event_idempotent_on_redelivery(
+        self, client, session_factory, seeded, monkeypatch
+    ):
+        _set_webhook_key(monkeypatch)
+        await _seed_sent_email(session_factory, seeded, message_id="msg-delivered-idem")
+
+        body = _build_event_body(
+            event_type="email.delivered",
+            event_id="evt-delivered-idem",
+            message_id="msg-delivered-idem",
+        )
+        sig, ts = _sign(body)
+
+        resp1 = await _post_signed(client, body, sig, ts)
+        assert resp1.status_code == 200
+
+        async with session_factory() as s:
+            sent = await s.get(SentEmail, "sent-estep-webhook")
+            first_delivered_at = sent.delivered_at
+            assert first_delivered_at is not None
+
+        # Redeliver the same event — marker catches it (already_processed)
+        resp2 = await _post_signed(client, body, sig, ts)
+        assert resp2.status_code == 200
+        assert resp2.json()["data"]["already_processed"] is True
+
+        async with session_factory() as s:
+            sent = await s.get(SentEmail, "sent-estep-webhook")
+            assert sent.delivered_at == first_delivered_at, (
+                "redelivery must not change delivered_at"
+            )

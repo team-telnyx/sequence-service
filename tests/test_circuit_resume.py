@@ -5,7 +5,6 @@ un-pauses them. This cron resumes them once the mailbox cools below the resume
 threshold (hysteresis), and re-queues the next step. A still-elevated mailbox
 stays paused.
 """
-from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest

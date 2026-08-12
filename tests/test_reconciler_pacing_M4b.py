@@ -26,7 +26,6 @@ never step.mailbox_id (grouping by the step column yields one NULL bucket = no
 pacing at all).
 """
 
-import math
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 

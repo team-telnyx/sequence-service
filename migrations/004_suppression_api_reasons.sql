@@ -20,18 +20,24 @@
 BEGIN;
 
 -- GUARD: the enum type exists (created by the base schema via create_all).
+-- The ORM (src/models/models.py SuppressionReason) uses
+-- Enum(SuppressionReason, name="suppression_reason", create_type=False) —
+-- the PG type name is 'suppression_reason' (with underscore), NOT the
+-- SQLAlchemy default 'suppressionreason'. Migration 003 followed the
+-- default for EnrollmentStepStatus (enrollmentstepstatus) because that
+-- model does NOT override the name; SuppressionReason DOES override it.
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_type WHERE typname = 'suppressionreason'
+    SELECT 1 FROM pg_type WHERE typname = 'suppression_reason'
   ) THEN
     RAISE EXCEPTION
-      'enum type suppressionreason does not exist — run base schema first';
+      'enum type suppression_reason does not exist — run base schema first';
   END IF;
 END $$;
 
-ALTER TYPE suppressionreason ADD VALUE IF NOT EXISTS 'API_BOUNCE';
-ALTER TYPE suppressionreason ADD VALUE IF NOT EXISTS 'API_COMPLAINT';
-ALTER TYPE suppressionreason ADD VALUE IF NOT EXISTS 'API_UNSUBSCRIBE';
+ALTER TYPE suppression_reason ADD VALUE IF NOT EXISTS 'API_BOUNCE';
+ALTER TYPE suppression_reason ADD VALUE IF NOT EXISTS 'API_COMPLAINT';
+ALTER TYPE suppression_reason ADD VALUE IF NOT EXISTS 'API_UNSUBSCRIBE';
 
 COMMIT;

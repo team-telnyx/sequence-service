@@ -9,14 +9,16 @@ re-sending. A *known* GmailError (didn't deliver) removes the marker so the step
 stays retryable; only a hard crash mid-send leaves the marker → at-most-once
 (rare missed follow-up, never a duplicate).
 """
-import asyncio
+
 import pytest
-from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 from src.models.models import (
-    SequenceEnrollment, SequenceEnrollmentStep, SentEmail,
-    EnrollmentStatus, EnrollmentStepStatus,
+    SequenceEnrollment,
+    SequenceEnrollmentStep,
+    SentEmail,
+    EnrollmentStatus,
+    EnrollmentStepStatus,
 )
 import src.workers.sequence_step as ss
 
@@ -24,23 +26,35 @@ import src.workers.sequence_step as ss
 @pytest.fixture
 def gmail_ok():
     inbox = MagicMock()
-    inbox.send_html_email = MagicMock(return_value={"message_id": "gmail-123", "thread_id": "thr-1"})
+    inbox.send_html_email = MagicMock(
+        return_value={"message_id": "gmail-123", "thread_id": "thr-1"}
+    )
     return inbox
 
 
-async def _make_enrollment_step(session_factory, seeded, step_status=EnrollmentStepStatus.PENDING):
+async def _make_enrollment_step(
+    session_factory, seeded, step_status=EnrollmentStepStatus.PENDING
+):
     async with session_factory() as s:
         enr = SequenceEnrollment(
-            id="enr-1", sequence_id=seeded["sequence_id"],
-            mailbox_id=seeded["active_mailbox_id"], contact_email="vp@acme.com",
-            contact_name="VP", timezone="America/New_York",
-            status=EnrollmentStatus.ACTIVE, current_step=0,
+            id="enr-1",
+            sequence_id=seeded["sequence_id"],
+            mailbox_id=seeded["active_mailbox_id"],
+            contact_email="vp@acme.com",
+            contact_name="VP",
+            timezone="America/New_York",
+            status=EnrollmentStatus.ACTIVE,
+            current_step=0,
         )
         s.add(enr)
         es = SequenceEnrollmentStep(
-            id="estep-1", enrollment_id="enr-1", step_id="step-1",
-            mailbox_id=seeded["active_mailbox_id"], status=step_status,
-            custom_subject="Hi", custom_body="<p>Body</p>",
+            id="estep-1",
+            enrollment_id="enr-1",
+            step_id="step-1",
+            mailbox_id=seeded["active_mailbox_id"],
+            status=step_status,
+            custom_subject="Hi",
+            custom_body="<p>Body</p>",
         )
         s.add(es)
         await s.commit()
@@ -49,16 +63,21 @@ async def _make_enrollment_step(session_factory, seeded, step_status=EnrollmentS
 
 async def _count_sent(session_factory, step_id):
     from sqlalchemy import select, func
+
     async with session_factory() as s:
-        return (await s.execute(
-            select(func.count()).select_from(SentEmail)
-            .where(SentEmail.enrollment_step_id == step_id)
-        )).scalar()
+        return (
+            await s.execute(
+                select(func.count())
+                .select_from(SentEmail)
+                .where(SentEmail.enrollment_step_id == step_id)
+            )
+        ).scalar()
 
 
 def _patches(session_factory, gmail_inbox=None, gmail_error=False):
     """Patch the worker's external deps so process_sequence_step is drivable."""
     from src.services.gmail import GmailError
+
     cm = [
         patch.object(ss, "async_session", session_factory),
         patch.object(ss, "check_suppressed", new=_async_false),
@@ -77,11 +96,14 @@ async def _async_false(*a, **k):
 
 
 @pytest.mark.asyncio
-async def test_already_sent_marker_blocks_resend(seeded, session_factory, gmail_ok, monkeypatch):
+async def test_already_sent_marker_blocks_resend(
+    seeded, session_factory, gmail_ok, monkeypatch
+):
     step_id = await _make_enrollment_step(session_factory, seeded)
     monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
     cms = _patches(session_factory, gmail_ok)
-    for c in cms: c.start()
+    for c in cms:
+        c.start()
     try:
         # First send → one Gmail call, one SentEmail row.
         await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
@@ -100,11 +122,14 @@ async def test_already_sent_marker_blocks_resend(seeded, session_factory, gmail_
         assert gmail_ok.send_html_email.call_count == 1
         assert await _count_sent(session_factory, step_id) == 1
     finally:
-        for c in cms: c.stop()
+        for c in cms:
+            c.stop()
 
 
 @pytest.mark.asyncio
-async def test_marker_committed_before_send(seeded, session_factory, gmail_ok, monkeypatch):
+async def test_marker_committed_before_send(
+    seeded, session_factory, gmail_ok, monkeypatch
+):
     # The SentEmail marker must be durable (committed) BEFORE Gmail is called, so a
     # crash mid-send leaves the marker. Assert a row is visible from a SEPARATE
     # session at the moment send_html_email is invoked.
@@ -113,22 +138,29 @@ async def test_marker_committed_before_send(seeded, session_factory, gmail_ok, m
     # After a successful send exactly one row exists and its message_id is the
     # real Gmail id (updated from the pending sentinel that was committed first).
     cms = _patches(session_factory, gmail_ok)
-    for c in cms: c.start()
+    for c in cms:
+        c.start()
     try:
         await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
         from sqlalchemy import select
+
         async with session_factory() as s:
-            row = (await s.execute(
-                select(SentEmail).where(SentEmail.enrollment_step_id == step_id)
-            )).scalar_one()
+            row = (
+                await s.execute(
+                    select(SentEmail).where(SentEmail.enrollment_step_id == step_id)
+                )
+            ).scalar_one()
         assert row.message_id == "gmail-123"  # updated from the pending sentinel
         assert not row.message_id.startswith("pending-")
     finally:
-        for c in cms: c.stop()
+        for c in cms:
+            c.stop()
 
 
 @pytest.mark.asyncio
-async def test_gmail_error_clears_marker_so_step_is_retryable(seeded, session_factory, monkeypatch):
+async def test_gmail_error_clears_marker_so_step_is_retryable(
+    seeded, session_factory, monkeypatch
+):
     # A known GmailError means it did NOT deliver → the marker must be removed so
     # the step can retry (and capacity released). Otherwise a transient SMTP error
     # would permanently skip the prospect.
@@ -136,7 +168,8 @@ async def test_gmail_error_clears_marker_so_step_is_retryable(seeded, session_fa
     monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
     inbox = MagicMock()
     cms = _patches(session_factory, inbox, gmail_error=True)
-    for c in cms: c.start()
+    for c in cms:
+        c.start()
     try:
         with pytest.raises(Exception):
             await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
@@ -144,4 +177,5 @@ async def test_gmail_error_clears_marker_so_step_is_retryable(seeded, session_fa
         # never left.
         assert await _count_sent(session_factory, step_id) == 0
     finally:
-        for c in cms: c.stop()
+        for c in cms:
+            c.stop()

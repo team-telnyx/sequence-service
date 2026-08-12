@@ -32,6 +32,7 @@ from typing import Optional
 
 import structlog
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -140,9 +141,9 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
         }
 
     contact_email = (enrollment.contact_email or event.to_email).lower()
-    domain = contact_email.split("@")[1] if "@" in contact_email else None
 
     if event.event_type == EVENT_DELIVERED:
+        sent_email.delivered_at = datetime.utcnow()
         logger.info(
             "Email delivered (Telnyx Email API)",
             event_id=event.event_id,
@@ -151,11 +152,15 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
         )
     elif event.event_type in _REASON_MAP:
         reason = _REASON_MAP[event.event_type]
+        # API-event suppressions are EMAIL-scoped ONLY — domain=NULL prevents a
+        # single bounce at a@x.com from suppressing every contact at x.com (F1).
+        # The guard's domain semantics are NOT changed: manual domain rows
+        # (with domain set) still block domain-wide via check_suppressed.
         await _write_suppression(
             db,
             tenant_id=tenant_id,
             email=contact_email,
-            domain=domain,
+            domain=None,
             reason=reason,
             enrollment_id=enrollment.id,
             event=event,
@@ -196,6 +201,17 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
     }
 
 
+async def _suppression_exists(db: AsyncSession, tenant_id: str, email: str) -> bool:
+    """Check if a suppression row already exists for (tenant_id, email)."""
+    result = await db.execute(
+        select(Suppression.id).where(
+            Suppression.tenant_id == tenant_id,
+            Suppression.email == email,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def _write_suppression(
     db: AsyncSession,
     *,
@@ -210,17 +226,12 @@ async def _write_suppression(
 
     If the email is already suppressed (any reason — manual, reply, or a
     prior API event), skip the insert: the first suppression stands and is
-    never modified. A race-induced unique violation is caught and treated
-    as "already suppressed" (the unique constraint on (tenant_id, email)
-    is the durable guard).
+    never modified. A race-induced unique violation on (tenant_id, email)
+    is caught and treated as "already suppressed" — both concurrent requests
+    return 200, exactly one row survives (the unique constraint is the
+    durable guard).
     """
-    existing = await db.execute(
-        select(Suppression.id).where(
-            Suppression.tenant_id == tenant_id,
-            Suppression.email == email,
-        )
-    )
-    if existing.scalar_one_or_none() is not None:
+    if await _suppression_exists(db, tenant_id, email):
         logger.info(
             "Suppression already exists — one-way sync, not modified",
             event_id=event.event_id,
@@ -237,8 +248,17 @@ async def _write_suppression(
         source_enrollment_id=enrollment_id,
         notes=f"email_api_{event.event_type} event_id={event.event_id}",
     )
-    db.add(suppression)
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(suppression)
+            await db.flush()
+    except IntegrityError:
+        logger.info(
+            "Suppression insert lost the race — already suppressed by a concurrent event",
+            event_id=event.event_id,
+            email=email,
+        )
+        return
     logger.info(
         "Suppression written (Email API origin)",
         event_id=event.event_id,

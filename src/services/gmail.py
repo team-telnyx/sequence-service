@@ -13,7 +13,7 @@ import html
 import re
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from email.message import EmailMessage
 from typing import Optional
 

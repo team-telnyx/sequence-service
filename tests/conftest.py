@@ -6,10 +6,8 @@ dependency is overridden to use the test session, and the ARQ queue call is
 mocked so tests never touch Redis.
 """
 
-import uuid
 from unittest.mock import AsyncMock
 
-import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine

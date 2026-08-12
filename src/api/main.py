@@ -1,17 +1,16 @@
 """FastAPI application for Sequence Service."""
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 import logging
 import socket
 from urllib.parse import urlparse
 
 from src.config import get_settings
-from src.models.base import get_db, engine, Base, async_session
+from src.models.base import engine, Base, async_session
 from src.api import (
     enrollments,
     sequences,

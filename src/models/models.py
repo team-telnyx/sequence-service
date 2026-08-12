@@ -279,6 +279,7 @@ class SentEmail(Base):
     from_email: Mapped[str] = mapped_column(String(255))
     from_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     sent_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
     # Relationships
     mailbox: Mapped["Mailbox"] = relationship(back_populates="sent_emails")

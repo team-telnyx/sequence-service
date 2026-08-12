@@ -12,7 +12,15 @@ from urllib.parse import urlparse
 
 from src.config import get_settings
 from src.models.base import get_db, engine, Base, async_session
-from src.api import enrollments, sequences, mailboxes, webhooks, tracking, suppressions
+from src.api import (
+    enrollments,
+    sequences,
+    mailboxes,
+    webhooks,
+    tracking,
+    suppressions,
+    email_events,
+)
 
 settings = get_settings()
 logger = logging.getLogger("sequence_service")
@@ -48,7 +56,8 @@ async def lifespan(app: FastAPI):
                 "TRACKING HOST UNREACHABLE: %s does not resolve, but tracking_enabled=%s / "
                 "one_click_unsubscribe_enabled=%s — emails would ship dead tracking/unsubscribe "
                 "links. Set a reachable TRACKING_BASE_URL or disable these flags.",
-                settings.tracking_base_url, settings.tracking_enabled,
+                settings.tracking_base_url,
+                settings.tracking_enabled,
                 settings.one_click_unsubscribe_enabled,
             )
         else:
@@ -92,8 +101,16 @@ async def authenticate_tenant(request: Request, call_next):
     distinguish an auth failure (don't retry) from a server error (retry) and
     avoids retry storms.
     """
-    # Skip auth for health check and tracking endpoints
-    if request.url.path == "/health" or request.url.path.startswith("/track/"):
+    # Skip auth for health check, tracking, and inbound webhook receivers.
+    # The Email API webhook receiver (REVOPS-1552) authenticates via Ed25519
+    # signature verification over the raw body — Telnyx sends no X-API-Key,
+    # and the signature check replaces tenant auth for that path. Fail
+    # closed: nothing on the webhook path is processed unverified.
+    if (
+        request.url.path == "/health"
+        or request.url.path.startswith("/track/")
+        or request.url.path == "/webhooks/email-events"
+    ):
         return await call_next(request)
 
     api_key = request.headers.get("X-API-Key")
@@ -105,9 +122,7 @@ async def authenticate_tenant(request: Request, call_next):
     from src.models.models import Tenant
 
     async with async_session() as db:
-        result = await db.execute(
-            select(Tenant).where(Tenant.api_key == api_key)
-        )
+        result = await db.execute(select(Tenant).where(Tenant.api_key == api_key))
         tenant = result.scalar_one_or_none()
 
     if not tenant:
@@ -134,9 +149,13 @@ app.include_router(enrollments.router, prefix="/api/enrollments", tags=["enrollm
 app.include_router(mailboxes.router, prefix="/api/mailboxes", tags=["mailboxes"])
 app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(tracking.router, prefix="/track", tags=["tracking"])
-app.include_router(suppressions.router, prefix="/api/suppressions", tags=["suppressions"])
+app.include_router(
+    suppressions.router, prefix="/api/suppressions", tags=["suppressions"]
+)
+app.include_router(email_events.router, prefix="/webhooks", tags=["email-events"])
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=settings.api_host, port=settings.api_port)

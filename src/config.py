@@ -178,6 +178,18 @@ class Settings(BaseSettings):
     # now instead of firing immediately (prevents back-to-back catch-up sends).
     min_step_gap_hours: int = 24
 
+    # Telnyx Email API webhook receiver (REVOPS-1552). The Ed25519 public key
+    # used to verify inbound webhook event signatures (delivered/bounce/
+    # complaint/one-click-unsubscribe). The key is provisioned in the Telnyx
+    # portal; only the NAME is read from env — the key VALUE never appears in
+    # the repo. Empty string disables verification (the endpoint will reject
+    # all events with 401 until a key is set — fail closed, never accept an
+    # unverified event).
+    telnyx_webhook_public_key: str = ""
+    # Reject webhook events whose timestamp header is more than this many
+    # seconds from now (replay protection). Default 300s = 5 minutes.
+    telnyx_webhook_timestamp_tolerance_seconds: int = 300
+
     # Logging
     log_level: str = "INFO"
 

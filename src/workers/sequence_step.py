@@ -518,10 +518,14 @@ async def process_sequence_step(
                 # P1-A: retryable adapter errors (429/5xx/timeout) must raise
                 # arq.worker.Retry so ARQ actually re-enqueues with backoff.
                 # The adapter sets e.retryable=True for those and False for
-                # permanent 4xx. Permanent 4xx keeps the Gmail-path terminal
-                # contract (RuntimeError — fail once, reconcile re-enqueues
-                # later) so the two transports behave identically on
-                # permanent failures.
+                # permanent 4xx. r5: permanent 4xx terminalizes to a durable
+                # EnrollmentStepStatus.FAILED (same contract as the r4
+                # max_tries-exhausted path below — marker removed + capacity
+                # released above the branch, error preserved in the log +
+                # result dict) so the reconciler's predicate
+                # (status == SCHEDULED) excludes it — no infinite
+                # re-enqueue loop. The Gmail path's RuntimeError contract is
+                # pre-existing semantics, untouched here (out of PR scope).
                 if e.retryable:
                     # r4: the SINGLE choke point for last-attempt terminal
                     # conversion. ARQ exposes the 1-based attempt in
@@ -580,7 +584,32 @@ async def process_sequence_step(
                         error=str(e),
                     )
                     raise ArqRetry(defer=defer_s) from e
-                raise RuntimeError(f"Email API send failed: {e}") from e
+                # r5: permanent 4xx — terminalize to FAILED (same contract as
+                # the r4 max_tries-exhausted path above: marker already removed
+                # and capacity already released above the branch; underlying
+                # error preserved in the structured log + the result dict).
+                # The reconciler's predicate (status == SCHEDULED) excludes
+                # FAILED, so a permanent Email API rejection can no longer be
+                # re-enqueued post-grace (the reviewer's scratch-PG
+                # reproduction showed POST_GRACE_RECONCILED=2 on a 400). The
+                # Gmail path's RuntimeError contract is pre-existing
+                # semantics, untouched here — out of PR scope (documented in
+                # the PR body).
+                enrollment_step.status = EnrollmentStepStatus.FAILED
+                await db.commit()
+                logger.error(
+                    "Email API permanent error — terminal failure (row -> FAILED)",
+                    error=str(e),
+                    status_code=e.status_code,
+                    enrollment_step_id=enrollment_step_id,
+                    mailbox_id=mailbox.id,
+                )
+                return {
+                    "failed": True,
+                    "reason": "permanent_error",
+                    "error": str(e),
+                    "status_code": e.status_code,
+                }
         elif mailbox.transport == "gmail":
             if settings.gmail_enabled:
                 # Gmail path (byte-identical to pre-1552 behavior). Offload

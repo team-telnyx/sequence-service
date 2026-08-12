@@ -825,10 +825,16 @@ class TestTransportSelection:
 class TestRetrySemantics:
     """P1-A: retryable adapter errors (429/5xx/timeout) must raise
     arq.worker.Retry(defer=...) so ARQ actually re-enqueues with backoff.
-    Permanent 4xx stays a terminal RuntimeError (the Gmail contract).
+    Permanent 4xx (r5) terminalizes to a durable FAILED — same contract as
+    the r4 max_tries-exhausted path (marker removed, capacity released,
+    error preserved in the log + result dict). The reconciler's predicate
+    (status == SCHEDULED) excludes FAILED, so a permanent Email API
+    rejection can no longer be re-enqueued post-grace. The Gmail path's
+    RuntimeError contract is pre-existing semantics, untouched by r5 —
+    out of PR scope (documented in the PR body).
 
     All tests mock ONLY the HTTP layer (P2-B) so the real payload builder +
-    error mapping + the worker's Retry/RuntimeError dispatch run under test.
+    error mapping + the worker's Retry/FAILED dispatch run under test.
     """
 
     @pytest.mark.asyncio
@@ -997,10 +1003,18 @@ class TestRetrySemantics:
     async def test_400_terminal_failure_no_retry(
         self, seeded, session_factory, monkeypatch
     ):
-        """Permanent 4xx (400) → RuntimeError (terminal, NOT ArqRetry). The
-        Gmail-path contract: fail once, let reconcile re-enqueue later.
-        Marker removed + capacity released so the step is retryable by
-        reconcile."""
+        """r5: Permanent 4xx (400) → durable terminal FAILED (NOT RuntimeError,
+        NOT ArqRetry). Same failure-recording contract as the r4 max_tries-
+        exhausted path: marker removed, capacity released, error preserved in
+        the structured log + result dict. The reconciler's predicate
+        (status == SCHEDULED) excludes FAILED, so a permanent Email API
+        rejection can no longer be re-enqueued post-grace (the reviewer's
+        scratch-PG reproduction showed POST_GRACE_RECONCILED=2 on a 400). The
+        Gmail path's RuntimeError contract is pre-existing semantics, untouched
+        here — out of PR scope (documented in the PR body).
+
+        RED on 5c6f472: the r4-and-earlier contract raised RuntimeError and
+        left the row SCHEDULED, so the reconciler re-enqueued it forever."""
         from sqlalchemy import select, func
 
         async with session_factory() as s:
@@ -1032,13 +1046,25 @@ class TestRetrySemantics:
         for c in cms:
             c.start()
         try:
-            # Must be RuntimeError, NOT ArqRetry
-            with pytest.raises(RuntimeError) as exc_info:
-                await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
-            assert not isinstance(exc_info.value, ArqRetry), (
-                "400 must be terminal (RuntimeError), not ArqRetry"
+            # r5: must return a terminal-failure dict, NOT raise RuntimeError.
+            # The r4-and-earlier contract raised RuntimeError and left the row
+            # SCHEDULED, so the reconciler re-enqueued it forever
+            # (POST_GRACE_RECONCILED=2 on the reviewer's scratch PG).
+            result = await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            assert isinstance(result, dict), (
+                f"permanent 4xx must return terminal dict, not raise; "
+                f"got {type(result)}"
             )
+            assert result.get("failed") is True, (
+                f"expected terminal failure result, got {result}"
+            )
+            assert result.get("reason") == "permanent_error", result
+            assert result.get("status_code") == 400, result
             async with session_factory() as s:
+                es = await s.get(SequenceEnrollmentStep, step_id)
+                assert es.status == EnrollmentStepStatus.FAILED, (
+                    f"permanent 4xx must leave row FAILED, got {es.status}"
+                )
                 count = (
                     await s.execute(
                         select(func.count())
@@ -1046,7 +1072,9 @@ class TestRetrySemantics:
                         .where(ss.SentEmail.enrollment_step_id == step_id)
                     )
                 ).scalar()
-            assert count == 0, "SentEmail marker not removed after permanent failure"
+                assert count == 0, (
+                    "SentEmail marker not removed after permanent failure"
+                )
             assert seeded["active_mailbox_id"] in release_calls, (
                 "release_send not called after permanent failure — capacity leaked"
             )
@@ -1930,6 +1958,127 @@ class TestRealArqRetryExhaustion:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+
+# ── r5: permanent 4xx → durable FAILED, reconciler cannot resurrect ──────────
+
+
+class TestPermanent4xxReconcileExclusion:
+    """r5 BLOCKER 1: a permanent Email API rejection (non-retryable 4xx) must
+    terminalize to ``EnrollmentStepStatus.FAILED`` — the same failure-recording
+    contract as the r4 max_tries-exhausted path (marker removed, capacity
+    released, error preserved). The reconciler's predicate
+    (``status == SCHEDULED AND scheduled_at < cutoff``) excludes FAILED, so a
+    permanent 4xx can no longer be re-enqueued post-grace.
+
+    The reviewer reproduced the r4 bug on scratch PG: a 400 left the row
+    SCHEDULED (the RuntimeError path), and post-grace the reconciler
+    re-enqueued it (POST_GRACE_RECONCILED=2). The Gmail-parity argument was
+    ruled insufficient now that a durable FAILED state exists. The Gmail
+    path's RuntimeError contract is pre-existing semantics, untouched here —
+    out of PR scope.
+
+    The r4 ``TestRealArqRetryExhaustion`` test already proves FAILED is
+    invisible to the reconciler for the retryable exhaustion path via a real
+    ARQ + scratch Redis round-trip; this class covers the permanent-4xx path
+    with a unit-level predicate check (the reviewer explicitly ruled that
+    sufficient for r5).
+    """
+
+    @pytest.mark.asyncio
+    async def test_400_permanent_failure_excluded_from_reconcile(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """End-to-end (in-memory): a 400 leaves the row FAILED, then the
+        reconciler runs and must NOT re-enqueue it. RED on 5c6f472 because the
+        r4-and-earlier contract raised RuntimeError and left the row SCHEDULED,
+        so the reconciler would re-enqueue it (POST_GRACE_RECONCILED=2)."""
+        from datetime import timedelta
+        from sqlalchemy import select, func
+        import src.workers.reconcile as rec
+
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+        step_id = await _make_enrollment_step(
+            session_factory,
+            seeded,
+            seeded["active_mailbox_id"],
+            step_status=EnrollmentStepStatus.SCHEDULED,
+        )
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        def handler(req):
+            return _resp(
+                400,
+                json_body={"errors": [{"code": "10015", "detail": "bad idempotency"}]},
+            )
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            # 1. The send must terminalize to FAILED (not raise, not Retry).
+            result = await ss.process_sequence_step(
+                {"job_try": 1}, step_id, seeded["tenant_id"]
+            )
+            assert isinstance(result, dict), (
+                f"permanent 4xx must return terminal dict, not raise; "
+                f"got {type(result)}"
+            )
+            assert result.get("failed") is True, result
+            assert result.get("reason") == "permanent_error", result
+            async with session_factory() as s:
+                es = await s.get(SequenceEnrollmentStep, step_id)
+                assert es.status == EnrollmentStepStatus.FAILED, (
+                    f"permanent 4xx must leave row FAILED, got {es.status}"
+                )
+                # 2. Push scheduled_at into the past so the reconciler would
+                # re-enqueue IF the predicate didn't exclude FAILED. This
+                # isolates the test to the status-predicate, not the cutoff.
+                es.scheduled_at = datetime.utcnow() - timedelta(hours=2)
+                await s.commit()
+
+            # 3. Reconciler must NOT re-enqueue a FAILED row. Short grace so
+            # the past scheduled_at is unambiguously overdue.
+            monkeypatch.setattr(
+                rec.settings, "reconcile_grace_seconds", 1, raising=False
+            )
+            rec_q = AsyncMock(return_value="job-reconcile")
+            rec_cms = [
+                patch.object(rec, "async_session", session_factory),
+                patch.object(rec, "queue_sequence_step", rec_q),
+            ]
+            for c in rec_cms:
+                c.start()
+            try:
+                out = await rec.reconcile_scheduled_steps({})
+            finally:
+                for c in rec_cms:
+                    c.stop()
+            assert out["reconciled"] == 0, f"reconciler re-enqueued a FAILED row: {out}"
+            assert out["scanned"] == 0, (
+                f"reconciler selected a FAILED row into the batch: {out}"
+            )
+            rec_q.assert_not_awaited()
+
+            # 4. Marker removed + capacity released (same contract as r4).
+            async with session_factory() as s:
+                count = (
+                    await s.execute(
+                        select(func.count())
+                        .select_from(ss.SentEmail)
+                        .where(ss.SentEmail.enrollment_step_id == step_id)
+                    )
+                ).scalar()
+                assert count == 0, (
+                    "SentEmail marker not removed after permanent failure"
+                )
+        finally:
+            for c in cms:
+                c.stop()
 
 
 # ── live sandbox smoke test (gated, skipped by default) ──────────────────────

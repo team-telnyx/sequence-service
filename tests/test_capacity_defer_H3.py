@@ -14,7 +14,8 @@ UTC capacity reset and return {"deferred": True, "reason": "mailbox_at_capacity"
 The 75/day atomic cap (reserve_send conditional UPDATE) is UNCHANGED — this only
 swaps crash->defer behavior.
 """
-from datetime import datetime, timedelta, timezone
+
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -22,30 +23,47 @@ import pytest
 import src.workers.sequence_step as ss
 from src.services.mailbox_rotation import next_capacity_reset
 from src.models.models import (
-    SequenceEnrollment, SequenceEnrollmentStep, SentEmail,
-    EnrollmentStatus, EnrollmentStepStatus,
+    SequenceEnrollment,
+    SequenceEnrollmentStep,
+    SentEmail,
+    EnrollmentStatus,
+    EnrollmentStepStatus,
 )
 
 
 async def _make_enrollment_step(session_factory, seeded, *, mailbox_id):
     """An ACTIVE enrollment whose pending step is pinned to a (full) mailbox."""
     async with session_factory() as s:
-        s.add(SequenceEnrollment(
-            id="enr-cap", sequence_id=seeded["sequence_id"],
-            mailbox_id=mailbox_id, contact_email="vp@acme.com",
-            contact_name="VP", timezone="America/New_York",
-            status=EnrollmentStatus.ACTIVE, current_step=0,
-        ))
-        s.add(SequenceEnrollmentStep(
-            id="estep-cap", enrollment_id="enr-cap", step_id="step-1",
-            mailbox_id=mailbox_id, status=EnrollmentStepStatus.PENDING,
-            scheduled_at=None, custom_subject="Hi", custom_body="<p>Body</p>",
-        ))
+        s.add(
+            SequenceEnrollment(
+                id="enr-cap",
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=mailbox_id,
+                contact_email="vp@acme.com",
+                contact_name="VP",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=0,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="estep-cap",
+                enrollment_id="enr-cap",
+                step_id="step-1",
+                mailbox_id=mailbox_id,
+                status=EnrollmentStepStatus.PENDING,
+                scheduled_at=None,
+                custom_subject="Hi",
+                custom_body="<p>Body</p>",
+            )
+        )
         await s.commit()
     return "estep-cap"
 
 
 # ── mailbox_rotation: clean at-capacity reset-time helper ────────────────────
+
 
 def test_next_capacity_reset_is_next_0005_utc():
     # 12:00 UTC -> reset is 00:05 UTC the NEXT day
@@ -69,18 +87,35 @@ def test_next_capacity_reset_delay_seconds_positive():
 
 # ── worker: at-capacity defers (no raise, no send) ───────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_at_capacity_step_defers_not_raises(seeded, session_factory):
-    """Full sticky mailbox -> reserve_send False -> defer (no RuntimeError)."""
+    """Full sticky mailbox -> reserve_send False -> defer (no RuntimeError).
+
+    Pre-existing time-of-day flake (unmasked by evening review runs, fixed
+    in r5): the seeded enrollment uses ``timezone="America/New_York"`` but
+    this test didn't pin the send window, so outside 8am-5pm ET the worker
+    returned ``{"skipped": True, "reason": "outside_send_window"}`` BEFORE
+    reaching ``reserve_send`` — the assertion on the exact return dict then
+    failed. Fix: pin ``check_send_window`` to ``None`` (inside-window) inside
+    this test so the at-capacity branch is exercised deterministically at
+    any hour. Same pin the email_api tests use via ``_worker_patches``
+    (``patch.object(ss, "check_send_window", new=lambda tz: None)``). Only
+    this test needed it — the sibling at-capacity tests check side effects
+    (SentEmail absence, step status, mailbox counter) that hold true whether
+    the skip reason is ``outside_send_window`` or ``mailbox_at_capacity``,
+    so they never flaked. No production code touched.
+    """
     est = await _make_enrollment_step(
         session_factory, seeded, mailbox_id=seeded["full_mailbox_id"]
     )
     q = AsyncMock(return_value="job-deferred")
-    with patch.object(ss, "async_session", session_factory), \
-         patch.object(ss, "queue_sequence_step", q):
-        out = await ss.process_sequence_step(
-            {}, est, seeded["tenant_id"]
-        )
+    with (
+        patch.object(ss, "async_session", session_factory),
+        patch.object(ss, "check_send_window", return_value=None),
+        patch.object(ss, "queue_sequence_step", q),
+    ):
+        out = await ss.process_sequence_step({}, est, seeded["tenant_id"])
     assert out == {"deferred": True, "reason": "mailbox_at_capacity"}
     # Re-queued the SAME step with a positive delay toward the next reset.
     q.assert_awaited_once()
@@ -96,16 +131,18 @@ async def test_at_capacity_step_sends_nothing(seeded, session_factory):
         session_factory, seeded, mailbox_id=seeded["full_mailbox_id"]
     )
     q = AsyncMock(return_value="job-deferred")
-    with patch.object(ss, "async_session", session_factory), \
-         patch.object(ss, "queue_sequence_step", q):
+    with (
+        patch.object(ss, "async_session", session_factory),
+        patch.object(ss, "queue_sequence_step", q),
+    ):
         await ss.process_sequence_step({}, est, seeded["tenant_id"])
 
     async with session_factory() as s:
-        sent = (await s.execute(
-            SentEmail.__table__.select().where(
-                SentEmail.enrollment_step_id == est
+        sent = (
+            await s.execute(
+                SentEmail.__table__.select().where(SentEmail.enrollment_step_id == est)
             )
-        )).first()
+        ).first()
         assert sent is None
         step = await s.get(SequenceEnrollmentStep, est)
         # step is left in a re-processable state, never SENT
@@ -116,12 +153,15 @@ async def test_at_capacity_step_sends_nothing(seeded, session_factory):
 async def test_at_capacity_does_not_burn_a_send_slot(seeded, session_factory):
     """Deferral must not consume the full mailbox's sent_today (no over-send)."""
     from src.models.models import Mailbox
+
     est = await _make_enrollment_step(
         session_factory, seeded, mailbox_id=seeded["full_mailbox_id"]
     )
     q = AsyncMock(return_value="job-deferred")
-    with patch.object(ss, "async_session", session_factory), \
-         patch.object(ss, "queue_sequence_step", q):
+    with (
+        patch.object(ss, "async_session", session_factory),
+        patch.object(ss, "queue_sequence_step", q),
+    ):
         await ss.process_sequence_step({}, est, seeded["tenant_id"])
     async with session_factory() as s:
         mb = await s.get(Mailbox, seeded["full_mailbox_id"])

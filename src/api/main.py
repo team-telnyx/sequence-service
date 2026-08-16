@@ -6,8 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import logging
-import socket
-from urllib.parse import urlparse
 
 from src.config import get_settings
 from src.models.base import engine, Base, async_session
@@ -16,58 +14,20 @@ from src.api import (
     sequences,
     mailboxes,
     webhooks,
-    tracking,
     suppressions,
     email_events,
+    v1_enrollments,
 )
 
 settings = get_settings()
 logger = logging.getLogger("sequence_service")
 
 
-def _tracking_host_reachable() -> bool:
-    """DNS-resolve the tracking_base_url host (Wave 0 health probe) so a dead
-    unsubscribe/tracking host (e.g. track.telnyx.com NXDOMAIN) can never silently
-    ship on every email again."""
-    try:
-        host = urlparse(settings.tracking_base_url).hostname
-        if not host:
-            return False
-        socket.getaddrinfo(host, None)
-        return True
-    except Exception:
-        return False
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    # Startup: create tables if they don't exist (dev only)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-    # Wave 0 health probe: if open/click tracking OR one-click unsubscribe is on,
-    # the tracking host MUST resolve — else every email ships a dead link/endpoint.
-    # Fail LOUDLY rather than silently shipping a dead host (the original bug).
-    if settings.tracking_enabled or settings.one_click_unsubscribe_enabled:
-        if not _tracking_host_reachable():
-            logger.critical(
-                "TRACKING HOST UNREACHABLE: %s does not resolve, but tracking_enabled=%s / "
-                "one_click_unsubscribe_enabled=%s — emails would ship dead tracking/unsubscribe "
-                "links. Set a reachable TRACKING_BASE_URL or disable these flags.",
-                settings.tracking_base_url,
-                settings.tracking_enabled,
-                settings.one_click_unsubscribe_enabled,
-            )
-        else:
-            logger.info("Tracking host reachable: %s", settings.tracking_base_url)
-    else:
-        logger.info(
-            "Tracking + one-click unsubscribe disabled; using mailto unsubscribe "
-            "(reachable TRACKING_BASE_URL not required).",
-        )
     yield
-    # Shutdown
     await engine.dispose()
 
 
@@ -78,80 +38,84 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS — explicit origins only; wildcard+credentials is a CSRF surface.
+# Empty list = no CORS (fail-closed). CORS_ALLOWED_ORIGINS env var.
+_cors_origins = list(settings.cors_allowed_origins)
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=["X-API-Key", "Content-Type", "Authorization"],
+    )
+else:
+    logger.info("CORS disabled — CORS_ALLOWED_ORIGINS empty (fail-closed).")
 
 
-# Tenant authentication middleware
+# Paths that skip X-API-Key auth: health (unauthenticated by spec) and the
+# Email API webhook (Ed25519 raw-body verify replaces tenant auth).
+_NO_AUTH_PATHS = frozenset({"/health", "/health/live", "/health/ready"})
+
+
+def _is_health_or_webhook(path: str) -> bool:
+    return path in _NO_AUTH_PATHS or path == "/webhooks/email-events"
+
+
 @app.middleware("http")
 async def authenticate_tenant(request: Request, call_next):
-    """Extract and validate tenant from API key.
+    """Validate X-API-Key against SEQUENCE_SERVICE_API_KEY env var (not the
+    vestigial DB tenants.api_key column, which 401s in production).
 
-    H4 (REVOPS-972): auth failures MUST return a JSONResponse directly. Raising
-    HTTPException from inside pure-http middleware is NOT translated by
-    Starlette's BaseHTTPMiddleware — it bubbles up as an unhandled exception and
-    the client receives HTTP 500. Returning a JSONResponse(401) lets Scout
-    distinguish an auth failure (don't retry) from a server error (retry) and
-    avoids retry storms.
+    H4: returns JSONResponse(401) directly — raising HTTPException in
+    BaseHTTPMiddleware surfaces as 500, causing retry storms.
     """
-    # Skip auth for health check, tracking, and inbound webhook receivers.
-    # The Email API webhook receiver (REVOPS-1552) authenticates via Ed25519
-    # signature verification over the raw body — Telnyx sends no X-API-Key,
-    # and the signature check replaces tenant auth for that path. Fail
-    # closed: nothing on the webhook path is processed unverified.
-    if (
-        request.url.path == "/health"
-        or request.url.path.startswith("/track/")
-        or request.url.path == "/webhooks/email-events"
-    ):
+    if _is_health_or_webhook(request.url.path):
         return await call_next(request)
 
     api_key = request.headers.get("X-API-Key")
     if not api_key:
         return JSONResponse(status_code=401, content={"detail": "Missing API key"})
 
-    # Look up tenant by API key
-    from sqlalchemy import select
-    from src.models.models import Tenant
+    expected_key = settings.sequence_service_api_key
+    if not expected_key:
+        logger.error("SEQUENCE_SERVICE_API_KEY not configured — rejecting (fail closed).")
+        return JSONResponse(status_code=503, content={"detail": "Service not configured for auth"})
 
-    async with async_session() as db:
-        result = await db.execute(select(Tenant).where(Tenant.api_key == api_key))
-        tenant = result.scalar_one_or_none()
+    # Constant-time compare — avoids timing side channels.
+    import hmac as _hmac
 
-    if not tenant:
+    if not _hmac.compare_digest(api_key, expected_key):
         return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
 
-    request.state.tenant_id = tenant.id
+    # Scout-only deployment: single authenticated tenant is tenant-scout.
+    request.state.tenant_id = "tenant-scout"
 
     return await call_next(request)
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "version": "0.1.0",
-        "service": "sequence-service",
-    }
+    return {"status": "healthy", "version": "0.1.0", "service": "sequence-service"}
 
 
-# Register routers
+@app.get("/health/live")
+async def health_live():
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    return {"status": "ready"}
+
+
 app.include_router(sequences.router, prefix="/api/sequences", tags=["sequences"])
 app.include_router(enrollments.router, prefix="/api/enrollments", tags=["enrollments"])
 app.include_router(mailboxes.router, prefix="/api/mailboxes", tags=["mailboxes"])
 app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
-app.include_router(tracking.router, prefix="/track", tags=["tracking"])
-app.include_router(
-    suppressions.router, prefix="/api/suppressions", tags=["suppressions"]
-)
+app.include_router(suppressions.router, prefix="/api/suppressions", tags=["suppressions"])
 app.include_router(email_events.router, prefix="/webhooks", tags=["email-events"])
+app.include_router(v1_enrollments.router, prefix="/v1", tags=["v1-contracts"])
 
 
 if __name__ == "__main__":

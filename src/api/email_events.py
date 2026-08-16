@@ -45,8 +45,12 @@ from src.config import get_settings
 from src.models.base import get_db
 from src.services.email_events import (
     EVENT_BOUNCE,
+    EVENT_CLICKED,
     EVENT_COMPLAINT,
     EVENT_DELIVERED,
+    EVENT_OPENED,
+    EVENT_SENT,
+    EVENT_SUPPRESSED,
     EVENT_UNSUBSCRIBE,
     EmailEvent,
     process_email_event,
@@ -59,10 +63,15 @@ router = APIRouter()
 SIGNATURE_HEADER = "telnyx-signature-ed25519"
 TIMESTAMP_HEADER = "telnyx-timestamp"
 
+# Full Telnyx Email API event set (SV2-044: sent/delivered/bounced/opened/clicked/suppressed).
 _EVENT_TYPE_MAP = {
+    "email.sent": EVENT_SENT,
     "email.delivered": EVENT_DELIVERED,
     "email.bounced": EVENT_BOUNCE,
+    "email.opened": EVENT_OPENED,
+    "email.clicked": EVENT_CLICKED,
     "email.complained": EVENT_COMPLAINT,
+    "email.suppressed": EVENT_SUPPRESSED,
     "email.unsubscribed": EVENT_UNSUBSCRIBE,
 }
 
@@ -172,9 +181,7 @@ async def receive_email_event(
 
     public_key = _load_public_key(settings.telnyx_webhook_public_key)
     if public_key is None:
-        logger.error(
-            "Webhook public key not configured — rejecting event (fail closed)"
-        )
+        logger.error("Webhook public key not configured — rejecting event (fail closed)")
         return JSONResponse(
             status_code=401,
             content={"detail": "Webhook verification not configured"},
@@ -213,9 +220,7 @@ async def receive_email_event(
             "Webhook payload missing required fields",
             error=str(e),
         )
-        return JSONResponse(
-            status_code=400, content={"detail": "Missing required fields"}
-        )
+        return JSONResponse(status_code=400, content={"detail": "Missing required fields"})
 
     try:
         result = await process_email_event(db, event)

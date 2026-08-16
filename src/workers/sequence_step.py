@@ -21,7 +21,6 @@ from src.models.models import (
     EnrollmentStatus,
 )
 from src.services.email_builder import build_tracked_email
-from src.api.tracking import generate_unsubscribe_url
 from src.services.gmail import GmailService, GmailError
 from src.services.email_api import EmailAPITransport, EmailAPIError
 from src.services.mailbox_rotation import (
@@ -222,9 +221,7 @@ async def process_sequence_step(
         enrollment_step = result.scalar_one_or_none()
 
         if not enrollment_step:
-            logger.error(
-                "Enrollment step not found", enrollment_step_id=enrollment_step_id
-            )
+            logger.error("Enrollment step not found", enrollment_step_id=enrollment_step_id)
             raise ValueError(f"Enrollment step not found: {enrollment_step_id}")
 
         enrollment = enrollment_step.enrollment
@@ -310,9 +307,7 @@ async def process_sequence_step(
         # to a prospect is worse than a rare missed follow-up. A *known* GmailError
         # removes its marker (see below), so only a hard crash mid-send leaves one.
         existing_send = await db.execute(
-            select(SentEmail.id)
-            .where(SentEmail.enrollment_step_id == enrollment_step.id)
-            .limit(1)
+            select(SentEmail.id).where(SentEmail.enrollment_step_id == enrollment_step.id).limit(1)
         )
         if existing_send.scalar_one_or_none() is not None:
             logger.warning(
@@ -328,15 +323,11 @@ async def process_sequence_step(
         from src.models.models import Mailbox
         from src.config import validate_mailbox_for_tenant
 
-        result = await db.execute(
-            select(Mailbox).where(Mailbox.id == enrollment.mailbox_id)
-        )
+        result = await db.execute(select(Mailbox).where(Mailbox.id == enrollment.mailbox_id))
         mailbox = result.scalar_one_or_none()
 
         if not mailbox:
-            logger.error(
-                "Enrollment mailbox not found", mailbox_id=enrollment.mailbox_id
-            )
+            logger.error("Enrollment mailbox not found", mailbox_id=enrollment.mailbox_id)
             raise RuntimeError(f"Enrollment mailbox not found: {enrollment.mailbox_id}")
 
         # HARDCODED ENFORCEMENT: Verify mailbox is allowed for this tenant
@@ -385,9 +376,7 @@ async def process_sequence_step(
             # Scout composed this email - use it directly
             subject = enrollment_step.custom_subject
             body = enrollment_step.custom_body
-            logger.info(
-                "Using Scout-composed content", enrollment_step_id=enrollment_step_id
-            )
+            logger.info("Using Scout-composed content", enrollment_step_id=enrollment_step_id)
         else:
             # Fall back to step template
             subject, body = render_email(
@@ -410,9 +399,7 @@ async def process_sequence_step(
                 enrollment_step_id=enrollment_step_id,
                 enrollment_id=enrollment.id,
                 to_email=enrollment.contact_email,
-                has_custom=bool(
-                    enrollment_step.custom_subject and enrollment_step.custom_body
-                ),
+                has_custom=bool(enrollment_step.custom_subject and enrollment_step.custom_body),
             )
             enrollment_step.status = EnrollmentStepStatus.SKIPPED
             await db.commit()
@@ -455,18 +442,11 @@ async def process_sequence_step(
             enrollment_id=enrollment.id,
         )
 
-        # Build RFC 8058 List-Unsubscribe header. Advertise the one-click HTTPS
-        # endpoint ONLY when it's reachable (one_click_unsubscribe_enabled);
-        # otherwise mailto-only, so we never advertise a dead one-click URL
-        # (track.telnyx.com is NXDOMAIN — Wave 0 interim).
-        mailto_unsub = "<mailto:unsubscribe@telnyx.com?subject=unsubscribe>"
-        if settings.one_click_unsubscribe_enabled:
-            unsub_url = generate_unsubscribe_url(
-                settings.tracking_base_url, enrollment.id
-            )
-            list_unsubscribe = f"<{unsub_url}>, {mailto_unsub}"
-        else:
-            list_unsubscribe = mailto_unsub
+        # Build RFC 8058 List-Unsubscribe header. mailto: only — no first-party
+        # HTTPS endpoint (the /track/unsubscribe base64 endpoint was deleted in
+        # SV2-044). One-click unsubscribe is handled by the Email API webhook
+        # (email.unsubscribed events) when the Email API is the transport.
+        list_unsubscribe = "<mailto:unsubscribe@telnyx.com?subject=unsubscribe>"
 
         # REVOPS-1552: per-mailbox transport selection. The Mailbox.transport
         # column ('gmail' default | 'email_api') drives the send path. P1-B:
@@ -485,7 +465,6 @@ async def process_sequence_step(
                     plain_text_fallback=plain_body,
                     sender_name=mailbox.display_name,
                     list_unsubscribe=list_unsubscribe,
-                    one_click=settings.one_click_unsubscribe_enabled,
                     bcc=settings.salesforce_bcc_address or None,
                 )
                 api_message_id = result["message_id"]
@@ -574,9 +553,7 @@ async def process_sequence_step(
                     # cap in _compute_retry_defer bounds the advance so a
                     # genuinely lost job is still detected within
                     # cap + grace.
-                    enrollment_step.scheduled_at = datetime.utcnow() + timedelta(
-                        seconds=defer_s
-                    )
+                    enrollment_step.scheduled_at = datetime.utcnow() + timedelta(seconds=defer_s)
                     await db.commit()
                     logger.info(
                         "Email API retryable error — deferring arq retry",
@@ -630,7 +607,6 @@ async def process_sequence_step(
                         plain_text_fallback=plain_body,
                         sender_name=mailbox.display_name,
                         list_unsubscribe=list_unsubscribe,
-                        one_click=settings.one_click_unsubscribe_enabled,
                         bcc=settings.salesforce_bcc_address or None,
                     )
                     gmail_message_id = result["message_id"]
@@ -651,15 +627,11 @@ async def process_sequence_step(
                         await db.delete(sent_email)
                         await db.commit()
                     except Exception as del_err:
-                        logger.warning(
-                            "Failed to remove send marker", error=str(del_err)
-                        )
+                        logger.warning("Failed to remove send marker", error=str(del_err))
                     try:
                         await release_send(db, mailbox.id)
                     except Exception as rel_err:
-                        logger.warning(
-                            "Failed to release send slot", error=str(rel_err)
-                        )
+                        logger.warning("Failed to release send slot", error=str(rel_err))
                     raise RuntimeError(f"Gmail send failed: {e}")
             else:
                 # Stub mode - generate fake message ID
@@ -827,9 +799,7 @@ async def _queue_next_step(
     # (absolute time), not the raw step delay, so the job fires at the right
     # moment even when a prior step ran late (past-due guard pushed
     # scheduled_at forward to now + min_gap).
-    delay_seconds = int(
-        max(0, (next_enrollment_step.scheduled_at - now).total_seconds())
-    )
+    delay_seconds = int(max(0, (next_enrollment_step.scheduled_at - now).total_seconds()))
     try:
         job_id = await queue_sequence_step(
             enrollment_step_id=next_enrollment_step.id,

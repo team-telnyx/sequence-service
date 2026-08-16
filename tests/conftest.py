@@ -59,32 +59,60 @@ async def seeded(session_factory):
         db.add(tenant)
 
         mb_active = Mailbox(
-            id="mb-active", tenant_id=SCOUT_TENANT_ID, email="quinn.c@telnyx.com",
-            status=MailboxStatus.ACTIVE, weight=1, daily_send_limit=50, sent_today=10,
+            id="mb-active",
+            tenant_id=SCOUT_TENANT_ID,
+            email="quinn.c@telnyx.com",
+            status=MailboxStatus.ACTIVE,
+            weight=1,
+            daily_send_limit=50,
+            sent_today=10,
         )
         mb_full = Mailbox(
-            id="mb-full", tenant_id=SCOUT_TENANT_ID, email="quinn.d@telnyx.com",
-            status=MailboxStatus.ACTIVE, weight=1, daily_send_limit=50, sent_today=50,
+            id="mb-full",
+            tenant_id=SCOUT_TENANT_ID,
+            email="quinn.d@telnyx.com",
+            status=MailboxStatus.ACTIVE,
+            weight=1,
+            daily_send_limit=50,
+            sent_today=50,
         )
         mb_paused = Mailbox(
-            id="mb-paused", tenant_id=SCOUT_TENANT_ID, email="quinn.e@telnyx.com",
-            status=MailboxStatus.PAUSED, weight=1, daily_send_limit=50, sent_today=0,
+            id="mb-paused",
+            tenant_id=SCOUT_TENANT_ID,
+            email="quinn.e@telnyx.com",
+            status=MailboxStatus.PAUSED,
+            weight=1,
+            daily_send_limit=50,
+            sent_today=0,
         )
         mb_other = Mailbox(
-            id="mb-other", tenant_id=SCOUT_TENANT_ID, email="quinn.f@telnyx.com",
-            status=MailboxStatus.ACTIVE, weight=1, daily_send_limit=50, sent_today=5,
+            id="mb-other",
+            tenant_id=SCOUT_TENANT_ID,
+            email="quinn.f@telnyx.com",
+            status=MailboxStatus.ACTIVE,
+            weight=1,
+            daily_send_limit=50,
+            sent_today=5,
         )
         db.add_all([mb_active, mb_full, mb_paused, mb_other])
 
         seq = Sequence(
-            id="seq-1", tenant_id=SCOUT_TENANT_ID, name="Test Seq",
+            id="seq-1",
+            tenant_id=SCOUT_TENANT_ID,
+            name="Test Seq",
             status=SequenceStatus.ACTIVE,
         )
         db.add(seq)
-        db.add(SequenceStep(id="step-1", sequence_id="seq-1", step_number=1,
-                            subject="Hi", body="Body 1"))
-        db.add(SequenceStep(id="step-2", sequence_id="seq-1", step_number=2,
-                            subject="Follow up", body="Body 2"))
+        db.add(
+            SequenceStep(
+                id="step-1", sequence_id="seq-1", step_number=1, subject="Hi", body="Body 1"
+            )
+        )
+        db.add(
+            SequenceStep(
+                id="step-2", sequence_id="seq-1", step_number=2, subject="Follow up", body="Body 2"
+            )
+        )
         await db.commit()
 
     return {
@@ -103,21 +131,26 @@ async def seeded(session_factory):
 
 @pytest_asyncio.fixture
 async def client(session_factory, monkeypatch):
-    """AsyncClient wired to the app with get_db overridden and queue mocked."""
-    # Avoid Redis: stub the queue call used by create_enrollment.
+    """AsyncClient wired to the app with get_db overridden and queue mocked.
+
+    SV2-044: auth is now env-var-based (SEQUENCE_SERVICE_API_KEY), not DB-tenant.
+    The middleware reads settings.sequence_service_api_key; patch it to the
+    test key so authenticated requests succeed. The old async_session DB-lookup
+    patch is no longer needed (the middleware no longer opens a DB session for auth).
+    """
     import src.api.enrollments as enrollments_mod
+    import src.api.main as main_mod
+
     monkeypatch.setattr(
-        enrollments_mod, "queue_sequence_step",
+        enrollments_mod,
+        "queue_sequence_step",
         AsyncMock(return_value="job-test"),
     )
+    monkeypatch.setattr(main_mod.settings, "sequence_service_api_key", SCOUT_API_KEY)
 
     async def _override_get_db():
         async with session_factory() as session:
             yield session
-
-    # The tenant-auth middleware also opens its own async_session() to look up
-    # the tenant by api key; point that at the test engine too.
-    monkeypatch.setattr("src.api.main.async_session", session_factory)
 
     app.dependency_overrides[get_db] = _override_get_db
     transport = ASGITransport(app=app)

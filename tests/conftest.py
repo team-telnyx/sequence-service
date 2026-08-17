@@ -219,6 +219,7 @@ _MIGRATIONS_IN_ORDER = [
     "005_sent_email_delivered_at.sql",
     "006_idempotency_records_sv2_044.sql",
     "007_signals_reply_intent_sv2_044.sql",
+    "008_email_events_poller_cursor.sql",
 ]
 
 # Migration 006 — kept for the standalone test

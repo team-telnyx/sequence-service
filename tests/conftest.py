@@ -217,9 +217,7 @@ _PG_CREATE_SUPPRESSION_REASON_ENUM = (
 # with the production server-side DEFAULT (now() AT TIME ZONE 'UTC') on
 # created_at. This is the schema the naive-UTC integration assertion verifies.
 _PG_MIGRATION_006_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "migrations"
-    / "006_idempotency_records_sv2_044.sql"
+    Path(__file__).resolve().parent.parent / "migrations" / "006_idempotency_records_sv2_044.sql"
 )
 
 
@@ -233,9 +231,7 @@ def _split_sql_statements(sql_text: str) -> list[str]:
     for raw in sql_text.split(";"):
         stmt = raw.strip()
         # Drop full-line comment lines but keep inline comments (PG handles them).
-        lines = [
-            line for line in stmt.splitlines() if not line.strip().startswith("--")
-        ]
+        lines = [line for line in stmt.splitlines() if not line.strip().startswith("--")]
         cleaned = "\n".join(lines).strip()
         if cleaned:
             statements.append(cleaned)
@@ -279,14 +275,23 @@ async def _pg_db_url():
 async def pg_engine(_pg_db_url):
     """Fresh PG engine per test. Schema mirrors the production path: the app's
     lifespan hook runs Base.metadata.create_all on startup, so the fixture does
-    the same. The suppression_reason enum is pre-created (the ORM marks it
-    create_type=False — the migration owns it, so create_all would otherwise
-    fail on a fresh PG DB). After create_all, the migration 006 server-side
-    DEFAULT (now() AT TIME ZONE 'UTC') on idempotency_records.created_at is
-    applied via ALTER COLUMN — migration 006's CREATE TABLE IF NOT EXISTS is a
-    no-op against create_all (the table already exists), so the default would
-    otherwise never land. This is the schema the naive-UTC integration assertion
-    exercises (both the ORM-written utcnow() path and the server-side default).
+    the same — EXCEPT for ``idempotency_records``. That table is the SV2-044
+    migration-owned table, and the r2 fixture masked a real drift by doing
+    ``create_all + ALTER COLUMN ... SET DEFAULT`` (the migration's
+    ``CREATE TABLE IF NOT EXISTS`` was a no-op against the create_all table,
+    so a migration that omitted a column the ORM has would still pass every
+    test — exactly the masked-defect failure mode an independent reviewer on
+    real PostgreSQL caught: ``UndefinedColumnError: column "id" does not
+    exist`` on the migration-only path).
+
+    r3 fix: the fixture drops the create_all ``idempotency_records`` and
+    applies migration 006's SQL standalone (the same path
+    ``test_pg_migration_006_schema_standalone`` exercises). Now every PG test
+    that touches the table runs against the MIGRATION-APPLIED schema — if the
+    migration and ORM drift again, the very next ORM insert/eager-load fails
+    loudly across the suite, not just in one standalone test. The
+    suppression_reason enum is still pre-created (the ORM marks it
+    create_type=False — the migration owns it).
 
     The DB is session-scoped (one disposable DB per pytest session) but the
     schema is fully reset per test via DROP SCHEMA CASCADE so every test starts
@@ -309,18 +314,17 @@ async def pg_engine(_pg_db_url):
         # The other enum types (mailboxstatus, sequencestatus, etc.) are created
         # automatically since they use create_type=True by default.
         await conn.run_sync(Base.metadata.create_all)
-        # Apply the migration 006 server-side DEFAULT (now() AT TIME ZONE 'UTC')
-        # to idempotency_records.created_at. Migration 006's CREATE TABLE IF NOT
-        # EXISTS is a no-op against create_all (the table already exists), so the
-        # default never lands via the migration alone. ALTER COLUMN SET DEFAULT
-        # matches the migration's intent and lets the naive-UTC assertion prove
-        # both code paths (ORM utcnow() + server-side default) write UTC.
-        await conn.execute(
-            text(
-                "ALTER TABLE idempotency_records ALTER COLUMN created_at "
-                "SET DEFAULT (now() AT TIME ZONE 'UTC')"
-            )
-        )
+        # SV2-044 r3: replace the create_all idempotency_records with the
+        # MIGRATION-APPLIED schema. The migration is the schema-of-record for
+        # production; create_all is the app's bootstrap convenience. If they
+        # drift, the migration loses (production deploy applies the migration,
+        # not create_all), so the fixture must run against the migration schema
+        # to catch the drift — not mask it with create_all + ALTER. The r2
+        # fixture masked exactly the r3 reviewer defect (missing ``id`` /
+        # ``updated_at``) this way.
+        await conn.execute(text("DROP TABLE IF EXISTS idempotency_records"))
+        for stmt in _split_sql_statements(_PG_MIGRATION_006_PATH.read_text()):
+            await conn.execute(text(stmt))
     yield eng
     await eng.dispose()
 

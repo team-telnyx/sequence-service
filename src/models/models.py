@@ -20,6 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from src.contracts import REPLY_INTENT_CONTRACT_VERSION, ReplyIntent
 from src.models.base import Base
 
 
@@ -272,6 +273,16 @@ class Signal(Base):
 
     sent_email_id: Mapped[str] = mapped_column(ForeignKey("sent_emails.id"))
     type: Mapped[SignalType] = mapped_column(Enum(SignalType))
+    # SV2-044 r3: versioned reply-intent classification (contracts.ReplyIntent).
+    # Set ONLY for signal types that carry a reply intent — REPLY (UNKNOWN
+    # pending deeper content analysis, out of scope for this packet) and
+    # OUT_OF_OFFICE (OUT_OF_OFFICE). NULL for BOUNCE (bounce is NOT a
+    # ReplyIntent — it is structurally detected and handled as a separate
+    # SignalType) and for non-reply signals (OPEN/CLICK/UNSUBSCRIBE).
+    reply_intent: Mapped[Optional[ReplyIntent]] = mapped_column(
+        Enum(ReplyIntent, name="reply_intent", create_type=False),
+        nullable=True,
+    )
     detected_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     raw_data: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -372,26 +383,11 @@ class ProcessedEmailEvent(Base):
     processed_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
 
-class ReplyIntent(str, enum.Enum):
-    """Versioned reply-intent taxonomy (SV2-044, contract_version=1).
-
-    Consumed at reply ingest (signal_detection.py). Bounce is NOT a
-    ReplyIntent — it is structurally detected (Gmail is_bounce flag or
-    Email-API bounce webhook event) and handled as a separate SignalType.
-    Referral routing is out of scope (REVOPS-1458).
-    """
-
-    POSITIVE_INTEREST = "positive_interest"
-    POSITIVE_MEETING = "positive_meeting"
-    NEGATIVE_NOT_INTERESTED = "negative_not_interested"
-    NEGATIVE_WRONG_PERSON = "negative_wrong_person"
-    OUT_OF_OFFICE = "out_of_office"
-    AUTORESPONDER = "autoresponder"
-    UNSUBSCRIBE_REQUEST = "unsubscribe_request"
-    UNKNOWN = "unknown"
-
-
-REPLY_INTENT_CONTRACT_VERSION = 1
+# ReplyIntent + REPLY_INTENT_CONTRACT_VERSION are re-exported from src.contracts
+# (the canonical contract module) for back-compat with callers that imported
+# them from models. SV2-044 r3: the canonical definition lives in contracts.py
+# so the contract-compat test can bite on a divergent server enum.
+__all_re_exports__ = ["ReplyIntent", "REPLY_INTENT_CONTRACT_VERSION"]
 
 
 class IdempotencyRecord(Base):

@@ -77,10 +77,13 @@ def _real_transport_with_mock_http(handler, timeout=30.0):
     Returns a list of unittest.mock patchers. Start/stop all together::
 
         patchers = _real_transport_with_mock_http(handler)
-        for p in patchers: p.start()
-        try: ...
+        for p in patchers:
+            p.start()
+        try:
+            ...
         finally:
-            for p in patchers: p.stop()
+            for p in patchers:
+                p.stop()
     """
     from src.services.email_api import EmailAPITransport
     import src.services.email_api as email_api_mod
@@ -202,9 +205,7 @@ class TestPayloadBuilder:
             list_unsubscribe="<https://track.telnyx.com/u/123>",
             one_click=True,
         )
-        assert (
-            payload["headers"]["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
-        )
+        assert payload["headers"]["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
 
     def test_future_send_at_added_as_scheduled_at(self):
         t = self._make_transport()
@@ -420,9 +421,7 @@ class TestErrorMapping:
 
         t = self._make_transport()
         client = _mock_client(
-            lambda r: _resp(
-                422, json_body={"errors": [{"code": "10027", "detail": "bad"}]}
-            )
+            lambda r: _resp(422, json_body={"errors": [{"code": "10027", "detail": "bad"}]})
         )
         with pytest.raises(EmailAPIPermanentError) as exc_info:
             await t.send_html_email(
@@ -442,9 +441,7 @@ class TestErrorMapping:
 
         t = self._make_transport()
         client = _mock_client(
-            lambda r: _resp(
-                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
-            )
+            lambda r: _resp(503, json_body={"errors": [{"code": "10016", "detail": "down"}]})
         )
         with pytest.raises(EmailAPIRetryableError) as exc_info:
             await t.send_html_email(
@@ -466,9 +463,7 @@ class TestErrorMapping:
         client = _mock_client(
             lambda r: _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
             )
         )
         with pytest.raises(EmailAPIReputationError) as exc_info:
@@ -534,9 +529,7 @@ class TestErrorMapping:
         client = _mock_client(
             lambda r: _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
                 headers={"Retry-After": "120"},
             )
         )
@@ -563,9 +556,7 @@ class TestErrorMapping:
         client = _mock_client(
             lambda r: _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
             )
         )
         with pytest.raises(EmailAPIReputationError) as exc_info:
@@ -617,9 +608,7 @@ class TestConfig:
 
 
 class TestMigrationDefault:
-    async def test_new_mailbox_defaults_to_gmail_transport(
-        self, session_factory, seeded
-    ):
+    async def test_new_mailbox_defaults_to_gmail_transport(self, session_factory, seeded):
         """A Mailbox created without specifying transport must default to
         'gmail' — the backfill guarantee (every existing mailbox stays Gmail)."""
         async with session_factory() as s:
@@ -704,9 +693,7 @@ class TestTransportSelection:
     ):
         """transport='gmail' → GmailService.send_html_email called (existing
         path, byte-identical behavior). Email API NOT touched."""
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         gmail_inbox = MagicMock()
@@ -734,9 +721,7 @@ class TestTransportSelection:
                 c.stop()
 
     @pytest.mark.asyncio
-    async def test_email_api_transport_takes_api_path(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_email_api_transport_takes_api_path(self, seeded, session_factory, monkeypatch):
         """transport='email_api' → real EmailAPITransport.send_html_email runs
         (P2-B: only HTTP mocked) and the HTTP POST is made. Gmail NOT touched."""
         async with session_factory() as s:
@@ -744,9 +729,7 @@ class TestTransportSelection:
             mb.transport = "email_api"
             await s.commit()
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         http_calls = []
@@ -790,9 +773,7 @@ class TestTransportSelection:
             mb.transport = "email_api"
             await s.commit()
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         def handler(req):
@@ -807,13 +788,61 @@ class TestTransportSelection:
             async with session_factory() as s:
                 row = (
                     await s.execute(
-                        select(ss.SentEmail).where(
-                            ss.SentEmail.enrollment_step_id == step_id
-                        )
+                        select(ss.SentEmail).where(ss.SentEmail.enrollment_step_id == step_id)
                     )
                 ).scalar_one()
             assert row.message_id == "telnyx-uuid-abc"
             assert not row.message_id.startswith("pending-")
+        finally:
+            for c in cms:
+                c.stop()
+
+    @pytest.mark.asyncio
+    async def test_email_api_send_passes_stable_idempotency_key(
+        self, seeded, session_factory, monkeypatch
+    ):
+        """SV2-044 r3 (FAIL 1c): the worker passes a STABLE Idempotency-Key
+        header on every Email-API send, derived DETERMINISTICALLY from the
+        logical send identity (``seq-send:{enrollment_step_id}``). A retry
+        reuses the SAME key → the Email API dedupes the second request
+        server-side. The r1 adapter generated a FRESH uuid4 per attempt →
+        duplicate delivery.
+
+        This is the load-bearing assertion for RETRY_REUSED_KEY=True on the
+        seq-svc side: the key is deterministic from the send identity, not
+        random per attempt.
+        """
+        async with session_factory() as s:
+            mb = await s.get(Mailbox, seeded["active_mailbox_id"])
+            mb.transport = "email_api"
+            await s.commit()
+
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
+        monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
+
+        captured_requests: list = []
+
+        def handler(req):
+            captured_requests.append(req)
+            return _ok_response(status="queued", msg_id="api-uuid")
+
+        cms = _worker_patches(session_factory)
+        cms.extend(_real_transport_with_mock_http(handler))
+        for c in cms:
+            c.start()
+        try:
+            await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
+            assert len(captured_requests) == 1, (
+                f"expected exactly one HTTP call, got {len(captured_requests)}"
+            )
+            req = captured_requests[0]
+            # The key is deterministic from the enrollment_step_id (the durable
+            # send identity). A retry would re-derive the SAME key from the
+            # SAME step_id → the Email API dedupes server-side.
+            assert req.headers.get("idempotency-key") == f"seq-send:{step_id}", (
+                f"Idempotency-Key header is {req.headers.get('idempotency-key')!r}, "
+                f"expected 'seq-send:{step_id}' (deterministic from send identity)"
+            )
         finally:
             for c in cms:
                 c.stop()
@@ -838,12 +867,24 @@ class TestRetrySemantics:
     """
 
     @pytest.mark.asyncio
-    async def test_429_raises_arq_retry_with_deferral(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_429_raises_arq_retry_with_deferral(self, seeded, session_factory, monkeypatch):
         """429 → arq.worker.Retry raised with a positive deferral (not
-        RuntimeError). The marker is removed and capacity released so the
-        retry's idempotency pre-check doesn't skip the re-send."""
+        RuntimeError).
+
+        SV2-044 r3 (FAIL 1c): the marker is KEPT (NOT removed) and capacity
+        is NOT released on a retryable error. The r1 path deleted the marker
+        then retried → the next arq attempt didn't see the marker, reserved
+        capacity AGAIN, and sent AGAIN → duplicate delivery after an
+        ambiguous timeout. The r3 fix: on retryable (429/5xx/timeout/
+        malformed-202), the durable marker (SentEmail row) survives so the
+        next arq attempt's pre-check (the existing_send block at the top of
+        process_sequence_step) sees the marker and SKIPS the re-send
+        (returns already_sent). Capacity stays reserved — if the original
+        attempt actually delivered, capacity is correctly consumed; if not,
+        we lose one slot until daily reset (the safer trade-off vs a
+        duplicate send to a prospect). The Idempotency-Key header on the
+        API request is defense-in-depth at the API layer.
+        """
         from sqlalchemy import select, func
 
         async with session_factory() as s:
@@ -851,9 +892,7 @@ class TestRetrySemantics:
             mb.transport = "email_api"
             await s.commit()
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         release_calls = []
@@ -866,9 +905,7 @@ class TestRetrySemantics:
         def handler(req):
             return _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
             )
 
         cms = _worker_patches(session_factory)
@@ -885,7 +922,9 @@ class TestRetrySemantics:
             assert exc_info.value.defer_score > 0, (
                 f"Retry defer must be > 0, got {exc_info.value.defer_score}"
             )
-            # marker removed so the retry re-sends
+            # r3: marker KEPT (NOT removed) so the next arq attempt's
+            # idempotency pre-check SKIPS the re-send (at-most-once). The r1
+            # path removed the marker → duplicate delivery on retry.
             async with session_factory() as s:
                 count = (
                     await s.execute(
@@ -894,35 +933,37 @@ class TestRetrySemantics:
                         .where(ss.SentEmail.enrollment_step_id == step_id)
                     )
                 ).scalar()
-            assert count == 0, "SentEmail marker not removed before Retry"
-            assert seeded["active_mailbox_id"] in release_calls, (
-                "release_send not called before Retry — capacity slot leaked"
+            assert count == 1, (
+                f"SentEmail marker must be KEPT on retryable error (at-most-once); "
+                f"got count={count} (r1 deleted it → duplicate delivery on retry)"
+            )
+            # r3: capacity NOT released on retryable — the original attempt
+            # may have consumed the slot. Releasing would let a re-send
+            # consume a SECOND slot for the same logical send, defeating the
+            # daily cap.
+            assert seeded["active_mailbox_id"] not in release_calls, (
+                "release_send must NOT be called on retryable error "
+                "(at-most-once; the original attempt may have consumed the slot)"
             )
         finally:
             for c in cms:
                 c.stop()
 
     @pytest.mark.asyncio
-    async def test_429_honors_retry_after_header(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_429_honors_retry_after_header(self, seeded, session_factory, monkeypatch):
         """429 with Retry-After: 120 → ArqRetry defer == 120s."""
         async with session_factory() as s:
             mb = await s.get(Mailbox, seeded["active_mailbox_id"])
             mb.transport = "email_api"
             await s.commit()
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         def handler(req):
             return _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
                 headers={"Retry-After": "120"},
             )
 
@@ -934,9 +975,7 @@ class TestRetrySemantics:
             with pytest.raises(ArqRetry) as exc_info:
                 await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
             defer_s = (exc_info.value.defer_score or 0) / 1000
-            assert defer_s == 120, (
-                f"Retry defer should honor Retry-After=120s, got {defer_s}s"
-            )
+            assert defer_s == 120, f"Retry defer should honor Retry-After=120s, got {defer_s}s"
         finally:
             for c in cms:
                 c.stop()
@@ -949,15 +988,11 @@ class TestRetrySemantics:
             mb.transport = "email_api"
             await s.commit()
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         def handler(req):
-            return _resp(
-                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
-            )
+            return _resp(503, json_body={"errors": [{"code": "10016", "detail": "down"}]})
 
         cms = _worker_patches(session_factory)
         cms.extend(_real_transport_with_mock_http(handler))
@@ -979,9 +1014,7 @@ class TestRetrySemantics:
             mb.transport = "email_api"
             await s.commit()
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         def handler(req):
@@ -1000,9 +1033,7 @@ class TestRetrySemantics:
                 c.stop()
 
     @pytest.mark.asyncio
-    async def test_400_terminal_failure_no_retry(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_400_terminal_failure_no_retry(self, seeded, session_factory, monkeypatch):
         """r5: Permanent 4xx (400) → durable terminal FAILED (NOT RuntimeError,
         NOT ArqRetry). Same failure-recording contract as the r4 max_tries-
         exhausted path: marker removed, capacity released, error preserved in
@@ -1022,9 +1053,7 @@ class TestRetrySemantics:
             mb.transport = "email_api"
             await s.commit()
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         release_calls = []
@@ -1052,12 +1081,9 @@ class TestRetrySemantics:
             # (POST_GRACE_RECONCILED=2 on the reviewer's scratch PG).
             result = await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
             assert isinstance(result, dict), (
-                f"permanent 4xx must return terminal dict, not raise; "
-                f"got {type(result)}"
+                f"permanent 4xx must return terminal dict, not raise; got {type(result)}"
             )
-            assert result.get("failed") is True, (
-                f"expected terminal failure result, got {result}"
-            )
+            assert result.get("failed") is True, f"expected terminal failure result, got {result}"
             assert result.get("reason") == "permanent_error", result
             assert result.get("status_code") == 400, result
             async with session_factory() as s:
@@ -1072,9 +1098,7 @@ class TestRetrySemantics:
                         .where(ss.SentEmail.enrollment_step_id == step_id)
                     )
                 ).scalar()
-                assert count == 0, (
-                    "SentEmail marker not removed after permanent failure"
-                )
+                assert count == 0, "SentEmail marker not removed after permanent failure"
             assert seeded["active_mailbox_id"] in release_calls, (
                 "release_send not called after permanent failure — capacity leaked"
             )
@@ -1111,9 +1135,7 @@ class TestUnknownTransport:
                 {"id": seeded["active_mailbox_id"]},
             )
 
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         gmail_inbox = MagicMock()
@@ -1191,9 +1213,7 @@ class TestMalformedSuccessBody:
         from src.services.email_api import EmailAPIRetryableError
 
         t = self._make_transport()
-        client = _mock_client(
-            lambda r: _resp(202, json_body={"data": {"status": "queued"}})
-        )
+        client = _mock_client(lambda r: _resp(202, json_body={"data": {"status": "queued"}}))
         with pytest.raises(EmailAPIRetryableError) as exc_info:
             await t.send_html_email(
                 from_email="q@telnyx.com",
@@ -1213,9 +1233,7 @@ class TestMalformedSuccessBody:
         from src.services.email_api import EmailAPIRetryableError
 
         t = self._make_transport()
-        client = _mock_client(
-            lambda r: _resp(202, json_body={"data": {"id": "uuid-abc"}})
-        )
+        client = _mock_client(lambda r: _resp(202, json_body={"data": {"id": "uuid-abc"}}))
         with pytest.raises(EmailAPIRetryableError) as exc_info:
             await t.send_html_email(
                 from_email="q@telnyx.com",
@@ -1259,9 +1277,7 @@ class TestMalformedSuccessBody:
             mb = await s.get(Mailbox, seeded["active_mailbox_id"])
             mb.transport = "email_api"
             await s.commit()
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
 
         def handler(req):
@@ -1302,30 +1318,22 @@ class TestRetryAfterDeferRace:
     """
 
     @pytest.mark.asyncio
-    async def test_retry_after_above_cap_is_capped(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_retry_after_above_cap_is_capped(self, seeded, session_factory, monkeypatch):
         """Retry-After=1200 with grace=900, fraction=0.5 → cap=450 → defer
         == 450 (NOT 1200). The next attempt re-reads Retry-After."""
         async with session_factory() as s:
             mb = await s.get(Mailbox, seeded["active_mailbox_id"])
             mb.transport = "email_api"
             await s.commit()
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
         monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
-        monkeypatch.setattr(
-            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
-        )
+        monkeypatch.setattr(ss.settings, "retry_defer_grace_fraction", 0.5, raising=False)
 
         def handler(req):
             return _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
                 headers={"Retry-After": "1200"},
             )
 
@@ -1338,37 +1346,28 @@ class TestRetryAfterDeferRace:
                 await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
             defer_s = (exc_info.value.defer_score or 0) / 1000
             assert defer_s == 450, (
-                f"Retry-After=1200 should be capped at 450 (grace=900 * 0.5), "
-                f"got {defer_s}"
+                f"Retry-After=1200 should be capped at 450 (grace=900 * 0.5), got {defer_s}"
             )
         finally:
             for c in cms:
                 c.stop()
 
     @pytest.mark.asyncio
-    async def test_retry_after_below_cap_honored(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_retry_after_below_cap_honored(self, seeded, session_factory, monkeypatch):
         """Retry-After=120 with cap=450 → defer == 120 (honored exactly)."""
         async with session_factory() as s:
             mb = await s.get(Mailbox, seeded["active_mailbox_id"])
             mb.transport = "email_api"
             await s.commit()
-        step_id = await _make_enrollment_step(
-            session_factory, seeded, seeded["active_mailbox_id"]
-        )
+        step_id = await _make_enrollment_step(session_factory, seeded, seeded["active_mailbox_id"])
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
         monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
-        monkeypatch.setattr(
-            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
-        )
+        monkeypatch.setattr(ss.settings, "retry_defer_grace_fraction", 0.5, raising=False)
 
         def handler(req):
             return _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
                 headers={"Retry-After": "120"},
             )
 
@@ -1381,17 +1380,14 @@ class TestRetryAfterDeferRace:
                 await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
             defer_s = (exc_info.value.defer_score or 0) / 1000
             assert defer_s == 120, (
-                f"Retry-After=120 (below cap=450) should be honored exactly, "
-                f"got {defer_s}"
+                f"Retry-After=120 (below cap=450) should be honored exactly, got {defer_s}"
             )
         finally:
             for c in cms:
                 c.stop()
 
     @pytest.mark.asyncio
-    async def test_defer_advances_scheduled_at(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_defer_advances_scheduled_at(self, seeded, session_factory, monkeypatch):
         """After a retryable 429 with long Retry-After, scheduled_at is
         advanced to ~now + capped_defer (not left at the original past value).
         This is the structural fix: the reconciler keys on
@@ -1414,16 +1410,12 @@ class TestRetryAfterDeferRace:
             await s.commit()
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
         monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
-        monkeypatch.setattr(
-            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
-        )
+        monkeypatch.setattr(ss.settings, "retry_defer_grace_fraction", 0.5, raising=False)
 
         def handler(req):
             return _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
                 headers={"Retry-After": "1200"},
             )
 
@@ -1484,17 +1476,13 @@ class TestRetryAfterDeferRace:
             await s.commit()
         monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
         monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 900, raising=False)
-        monkeypatch.setattr(
-            ss.settings, "retry_defer_grace_fraction", 0.5, raising=False
-        )
+        monkeypatch.setattr(ss.settings, "retry_defer_grace_fraction", 0.5, raising=False)
         monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 900, raising=False)
 
         def handler(req):
             return _resp(
                 429,
-                json_body={
-                    "errors": [{"code": "reputation_suspended", "detail": "poor"}]
-                },
+                json_body={"errors": [{"code": "reputation_suspended", "detail": "poor"}]},
                 headers={"Retry-After": "1200"},
             )
 
@@ -1507,9 +1495,7 @@ class TestRetryAfterDeferRace:
             with pytest.raises(ArqRetry) as exc_info:
                 await ss.process_sequence_step({}, step_id, seeded["tenant_id"])
             defer_s = (exc_info.value.defer_score or 0) / 1000
-            assert defer_s == 450, (
-                f"Retry-After=1200 should be capped at 450, got {defer_s}"
-            )
+            assert defer_s == 450, f"Retry-After=1200 should be capped at 450, got {defer_s}"
         finally:
             for c in cms:
                 c.stop()
@@ -1566,8 +1552,20 @@ class TestRetryExhaustionTerminal:
     ):
         """job_try == max_tries (3) on a 503 → terminal FAILED result, NO
         ArqRetry raised. Row leaves SCHEDULED so the reconciler cannot
-        resurrect it. Marker removed + capacity released (same cleanup as
-        the retry path)."""
+        resurrect it.
+
+        SV2-044 r3 (FAIL 1c): the marker is KEPT (not removed) and capacity
+        IS released. The marker is kept as at-most-once defense — the 503
+        was ambiguous (the send may have been delivered before the server
+        returned 503), so keeping the marker prevents a re-send if the row
+        is ever resurrected. Capacity IS released because the terminal-FAILED
+        path has no more retries — releasing is safe under at-most-once (a
+        re-send is impossible because the row is FAILED and the reconciler
+        won't resurrect it). The r4 test asserted marker-removed + capacity-
+        released; r3 corrects the marker assertion to kept (the r4 marker-
+        removed behavior would re-introduce the duplicate-delivery bug if
+        the row were ever resurrected).
+        """
         from sqlalchemy import select, func
 
         async with session_factory() as s:
@@ -1591,9 +1589,7 @@ class TestRetryExhaustionTerminal:
             return await original_release(db, mailbox_id)
 
         def handler(req):
-            return _resp(
-                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
-            )
+            return _resp(503, json_body={"errors": [{"code": "10016", "detail": "down"}]})
 
         cms = _worker_patches(session_factory)
         cms.extend(_real_transport_with_mock_http(handler))
@@ -1601,16 +1597,12 @@ class TestRetryExhaustionTerminal:
         for c in cms:
             c.start()
         try:
-            result = await ss.process_sequence_step(
-                {"job_try": 3}, step_id, seeded["tenant_id"]
-            )
+            result = await ss.process_sequence_step({"job_try": 3}, step_id, seeded["tenant_id"])
             # NOT an ArqRetry raise — a terminal failure result dict.
             assert isinstance(result, dict), (
                 f"last attempt must return a terminal result, not raise; got {type(result)}"
             )
-            assert result.get("failed") is True, (
-                f"expected terminal failure result, got {result}"
-            )
+            assert result.get("failed") is True, f"expected terminal failure result, got {result}"
             assert result.get("reason") == "max_retries_exhausted", result
             assert result.get("job_try") == 3, result
             assert result.get("max_tries") == 3, result
@@ -1620,6 +1612,11 @@ class TestRetryExhaustionTerminal:
                 assert es.status == EnrollmentStepStatus.FAILED, (
                     f"step must be FAILED after exhausting retries, got {es.status}"
                 )
+                # r3: marker KEPT (not removed) — at-most-once defense. The
+                # 503 was ambiguous (the send may have been delivered before
+                # the server returned 503). Keeping the marker prevents a
+                # re-send if the row is ever resurrected. The r4 test asserted
+                # count == 0 (marker removed); r3 corrects to count == 1.
                 count = (
                     await s.execute(
                         select(func.count())
@@ -1627,18 +1624,22 @@ class TestRetryExhaustionTerminal:
                         .where(ss.SentEmail.enrollment_step_id == step_id)
                     )
                 ).scalar()
-                assert count == 0, "SentEmail marker not removed on terminal failure"
+                assert count == 1, (
+                    f"SentEmail marker must be KEPT on terminal-failure retryable "
+                    f"(at-most-once defense); got count={count}"
+                )
+            # r3: capacity IS released on terminal-FAILED (no more retries —
+            # safe under at-most-once; a re-send is impossible because the row
+            # is FAILED and the reconciler won't resurrect it).
             assert seeded["active_mailbox_id"] in release_calls, (
-                "capacity slot not released on terminal failure"
+                "capacity slot must be released on terminal failure (no more retries)"
             )
         finally:
             for c in cms:
                 c.stop()
 
     @pytest.mark.asyncio
-    async def test_earlier_attempt_503_raises_arq_retry(
-        self, seeded, session_factory, monkeypatch
-    ):
+    async def test_earlier_attempt_503_raises_arq_retry(self, seeded, session_factory, monkeypatch):
         """job_try < max_tries (2 < 3) on a 503 → ArqRetry raised (today's
         behavior preserved). The retry path is unchanged for non-final
         attempts — the row stays SCHEDULED so the retry re-sends."""
@@ -1656,9 +1657,7 @@ class TestRetryExhaustionTerminal:
         monkeypatch.setattr(ss.settings, "worker_max_tries", 3, raising=False)
 
         def handler(req):
-            return _resp(
-                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
-            )
+            return _resp(503, json_body={"errors": [{"code": "10016", "detail": "down"}]})
 
         cms = _worker_patches(session_factory)
         cms.extend(_real_transport_with_mock_http(handler))
@@ -1666,9 +1665,7 @@ class TestRetryExhaustionTerminal:
             c.start()
         try:
             with pytest.raises(ArqRetry):
-                await ss.process_sequence_step(
-                    {"job_try": 2}, step_id, seeded["tenant_id"]
-                )
+                await ss.process_sequence_step({"job_try": 2}, step_id, seeded["tenant_id"])
             # Row stays SCHEDULED — still retryable by the next ARQ attempt.
             async with session_factory() as s:
                 es = await s.get(SequenceEnrollmentStep, step_id)
@@ -1708,9 +1705,7 @@ class TestRetryExhaustionTerminal:
         for c in cms:
             c.start()
         try:
-            result = await ss.process_sequence_step(
-                {"job_try": 3}, step_id, seeded["tenant_id"]
-            )
+            result = await ss.process_sequence_step({"job_try": 3}, step_id, seeded["tenant_id"])
             assert isinstance(result, dict) and result.get("failed") is True, (
                 f"malformed-202 on last attempt must return terminal failure, got {result}"
             )
@@ -1744,9 +1739,7 @@ class TestRetryExhaustionTerminal:
         monkeypatch.setattr(ss.settings, "worker_max_tries", 5, raising=False)
 
         def handler(req):
-            return _resp(
-                503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
-            )
+            return _resp(503, json_body={"errors": [{"code": "10016", "detail": "down"}]})
 
         cms = _worker_patches(session_factory)
         cms.extend(_real_transport_with_mock_http(handler))
@@ -1755,9 +1748,7 @@ class TestRetryExhaustionTerminal:
         try:
             # With max_tries=5, job_try=3 is NOT the last attempt → ArqRetry.
             with pytest.raises(ArqRetry):
-                await ss.process_sequence_step(
-                    {"job_try": 3}, step_id, seeded["tenant_id"]
-                )
+                await ss.process_sequence_step({"job_try": 3}, step_id, seeded["tenant_id"])
         finally:
             for c in cms:
                 c.stop()
@@ -1858,14 +1849,10 @@ class TestRealArqRetryExhaustion:
             monkeypatch.setattr(ss.settings, "worker_max_tries", 3, raising=False)
             # tiny grace so the reconciler predicate is exercisable without a
             # long real-time wait.
-            monkeypatch.setattr(
-                ss.settings, "reconcile_grace_seconds", 1, raising=False
-            )
+            monkeypatch.setattr(ss.settings, "reconcile_grace_seconds", 1, raising=False)
 
             def handler(req):
-                return _resp(
-                    503, json_body={"errors": [{"code": "10016", "detail": "down"}]}
-                )
+                return _resp(503, json_body={"errors": [{"code": "10016", "detail": "down"}]})
 
             # Patch the worker's DB session + transport + bypass guards.
             cms = _worker_patches(session_factory)
@@ -1888,9 +1875,7 @@ class TestRealArqRetryExhaustion:
             try:
                 # --- 3. enqueue the job on the real arq pool ---
                 pool = await create_pool(RedisSettings(host="127.0.0.1", port=port))
-                await pool.enqueue_job(
-                    "process_sequence_step", step_id, seeded["tenant_id"]
-                )
+                await pool.enqueue_job("process_sequence_step", step_id, seeded["tenant_id"])
                 await pool.close()
 
                 # --- 4. run a REAL arq Worker in burst to drain the queue ---
@@ -1930,9 +1915,7 @@ class TestRealArqRetryExhaustion:
                 # --- 6. reconciler must NOT re-enqueue a FAILED row ---
                 import src.workers.reconcile as rec
 
-                monkeypatch.setattr(
-                    rec.settings, "reconcile_grace_seconds", 1, raising=False
-                )
+                monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 1, raising=False)
                 queue_mock = AsyncMock(return_value="job-reconcile-test")
                 with (
                     patch.object(rec, "async_session", session_factory),
@@ -2021,12 +2004,9 @@ class TestPermanent4xxReconcileExclusion:
             c.start()
         try:
             # 1. The send must terminalize to FAILED (not raise, not Retry).
-            result = await ss.process_sequence_step(
-                {"job_try": 1}, step_id, seeded["tenant_id"]
-            )
+            result = await ss.process_sequence_step({"job_try": 1}, step_id, seeded["tenant_id"])
             assert isinstance(result, dict), (
-                f"permanent 4xx must return terminal dict, not raise; "
-                f"got {type(result)}"
+                f"permanent 4xx must return terminal dict, not raise; got {type(result)}"
             )
             assert result.get("failed") is True, result
             assert result.get("reason") == "permanent_error", result
@@ -2043,9 +2023,7 @@ class TestPermanent4xxReconcileExclusion:
 
             # 3. Reconciler must NOT re-enqueue a FAILED row. Short grace so
             # the past scheduled_at is unambiguously overdue.
-            monkeypatch.setattr(
-                rec.settings, "reconcile_grace_seconds", 1, raising=False
-            )
+            monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 1, raising=False)
             rec_q = AsyncMock(return_value="job-reconcile")
             rec_cms = [
                 patch.object(rec, "async_session", session_factory),
@@ -2059,9 +2037,7 @@ class TestPermanent4xxReconcileExclusion:
                 for c in rec_cms:
                     c.stop()
             assert out["reconciled"] == 0, f"reconciler re-enqueued a FAILED row: {out}"
-            assert out["scanned"] == 0, (
-                f"reconciler selected a FAILED row into the batch: {out}"
-            )
+            assert out["scanned"] == 0, f"reconciler selected a FAILED row into the batch: {out}"
             rec_q.assert_not_awaited()
 
             # 4. Marker removed + capacity released (same contract as r4).
@@ -2073,9 +2049,7 @@ class TestPermanent4xxReconcileExclusion:
                         .where(ss.SentEmail.enrollment_step_id == step_id)
                     )
                 ).scalar()
-                assert count == 0, (
-                    "SentEmail marker not removed after permanent failure"
-                )
+                assert count == 0, "SentEmail marker not removed after permanent failure"
         finally:
             for c in cms:
                 c.stop()

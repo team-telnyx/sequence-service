@@ -85,9 +85,7 @@ def _make_request(idempotency_key: str, contact_id: str = "contact-1") -> dict:
 
 
 @pytest.mark.asyncio
-async def test_pg_concurrent_same_key_one_enrollment(
-    pg_client, pg_seeded, pg_session_factory
-):
+async def test_pg_concurrent_same_key_one_enrollment(pg_client, pg_seeded, pg_session_factory):
     """Fire N>=10 concurrent identical requests on PG where the
     ON CONFLICT (scope, idempotency_key) DO NOTHING race is REAL (PG uses
     row-lock arbitration under the unique index, NOT SQLite's global write
@@ -121,9 +119,7 @@ async def test_pg_concurrent_same_key_one_enrollment(
     assert all(c in (200, 201) for c in codes), (
         f"Concurrent identical requests must not produce 4xx/5xx; got codes={codes}"
     )
-    assert statuses.count("reserved") == 1, (
-        f"Expected exactly one reserved, got {statuses}"
-    )
+    assert statuses.count("reserved") == 1, f"Expected exactly one reserved, got {statuses}"
     assert all(s in ("reserved", "existing") for s in statuses), (
         f"Expected reserved+existing only, got {statuses}"
     )
@@ -133,9 +129,7 @@ async def test_pg_concurrent_same_key_one_enrollment(
     # Some losers may see pending (enrollment_id=None) if they read before the
     # winner's commit lands — that's allowed, but at least one existing-response
     # must carry the real enrollment_id.
-    enrollment_ids = [
-        r.json().get("enrollment_id") for r in results if r.status_code == 200
-    ]
+    enrollment_ids = [r.json().get("enrollment_id") for r in results if r.status_code == 200]
     non_none_ids = [eid for eid in enrollment_ids if eid is not None]
     assert len(non_none_ids) >= 1, (
         f"At least one existing-response must carry the enrollment_id; got {enrollment_ids}"
@@ -209,9 +203,7 @@ async def test_pg_same_key_different_digest_returns_409(pg_client, pg_seeded):
 
 
 @pytest.mark.asyncio
-async def test_pg_naive_utc_scheduled_at_resists_host_tz_skew(
-    pg_session_factory, pg_seeded
-):
+async def test_pg_naive_utc_scheduled_at_resists_host_tz_skew(pg_session_factory, pg_seeded):
     """Force the PG session TZ to America/New_York (UTC-4 in August). The
     code writes scheduled_at via datetime.utcnow() (Python-side, naive UTC).
     Prove the stored value matches now() AT TIME ZONE 'UTC', NOT bare now()
@@ -331,9 +323,7 @@ async def test_pg_naive_utc_scheduled_at_resists_host_tz_skew(
 
 
 @pytest.mark.asyncio
-async def test_pg_idempotency_record_server_default_is_utc(
-    pg_session_factory, pg_seeded
-):
+async def test_pg_idempotency_record_server_default_is_utc(pg_session_factory, pg_seeded):
     """The migration 006 server-side DEFAULT (now() AT TIME ZONE 'UTC') on
     idempotency_records.created_at must produce UTC, not session-local time,
     when a row is inserted via raw SQL that omits the column. This is the
@@ -456,13 +446,9 @@ async def test_pg_unique_index_backs_on_conflict(pg_engine):
         pk_rows = [
             r
             for r in rows
-            if "UNIQUE" in r[1].upper()
-            and "scope" in r[1]
-            and "idempotency_key" in r[1]
+            if "UNIQUE" in r[1].upper() and "scope" in r[1] and "idempotency_key" in r[1]
         ]
-        assert len(pk_rows) >= 1, (
-            f"no unique index on (scope, idempotency_key); found: {rows}"
-        )
+        assert len(pk_rows) >= 1, f"no unique index on (scope, idempotency_key); found: {rows}"
 
         # The ON CONFLICT index_elements=["scope","idempotency_key"] targets
         # exactly this unique index. Verify by attempting a conflict: insert
@@ -502,10 +488,18 @@ async def test_pg_unique_index_backs_on_conflict(pg_engine):
 @pytest.mark.asyncio
 async def test_pg_migration_006_schema_standalone(pg_engine):
     """Apply migration 006's SQL to a fresh table (dropping the create_all
-    version first) and verify it creates the same unique PK + the server-side
-    now() AT TIME ZONE 'UTC' default. This proves the migration itself is
-    correct independent of the ORM — a reviewer applying only the migrations
-    (no create_all) gets the production-correct schema.
+    version first) and verify it creates the FULL schema matching the ORM:
+    inherited ``id`` and ``updated_at`` columns, the composite unique PK on
+    (scope, idempotency_key), the server-side now() AT TIME ZONE 'UTC'
+    defaults, and the request-digest lookup index. This proves the migration
+    itself is correct independent of the ORM — a reviewer applying only the
+    migrations (no create_all) gets the production-correct schema.
+
+    SV2-044 r3: the r2 migration omitted ``id`` and ``updated_at`` (the ORM
+    inherits them from Base), so a migration-only deploy raised
+    ``UndefinedColumnError: column "id" does not exist`` on the first ORM
+    insert. This test now asserts both columns exist with the right defaults
+    so the drift cannot recur.
     """
     async with pg_engine.begin() as conn:
         # Drop the create_all version and apply migration 006 standalone.
@@ -525,13 +519,10 @@ async def test_pg_migration_006_schema_standalone(pg_engine):
         pk_rows = [
             r
             for r in rows
-            if "UNIQUE" in r[1].upper()
-            and "scope" in r[1]
-            and "idempotency_key" in r[1]
+            if "UNIQUE" in r[1].upper() and "scope" in r[1] and "idempotency_key" in r[1]
         ]
         assert len(pk_rows) >= 1, (
-            f"migration 006 did not create a unique PK on (scope, idempotency_key); "
-            f"indexes: {rows}"
+            f"migration 006 did not create a unique PK on (scope, idempotency_key); indexes: {rows}"
         )
 
         # Verify the server-side DEFAULT (now() AT TIME ZONE 'UTC') on created_at.
@@ -549,12 +540,90 @@ async def test_pg_migration_006_schema_standalone(pg_engine):
             f"created_at DEFAULT is {default_val!r} — expected now() AT TIME ZONE 'UTC'"
         )
 
+        # r3: Verify the inherited ``id`` column exists (the r2 migration
+        # omitted it — the ORM inserts and the ORM query both blow up with
+        # ``UndefinedColumnError: column "id" does not exist`` on the
+        # migration-only path). The column is NOT a PK (the composite
+        # (scope, idempotency_key) is) — it is the inherited Base.id string
+        # the ORM uses as its row identity for db.get() / db.delete().
+        id_col = (
+            await conn.execute(
+                text(
+                    "SELECT column_name, data_type, is_nullable, column_default "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = 'idempotency_records' "
+                    "AND column_name = 'id'"
+                )
+            )
+        ).first()
+        assert id_col is not None, (
+            "migration 006 omitted the inherited `id` column — ORM inserts "
+            "will raise UndefinedColumnError on the migration-only path"
+        )
+        assert id_col[2] == "NO", f"id column must be NOT NULL; got {id_col[2]}"
+        # The default is gen_random_uuid()::text — lets raw inserts omit it.
+        assert id_col[3] is not None and "gen_random_uuid" in id_col[3], (
+            f"id column DEFAULT is {id_col[3]!r} — expected gen_random_uuid()::text"
+        )
+
+        # r3: Verify the inherited ``updated_at`` column exists (also omitted
+        # in r2 — same UndefinedColumnError class). Server-side DEFAULT mirrors
+        # created_at so raw-SQL inserts (backfills) write UTC, not session-local.
+        updated_at_col = (
+            await conn.execute(
+                text(
+                    "SELECT column_name, is_nullable, column_default "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = 'idempotency_records' "
+                    "AND column_name = 'updated_at'"
+                )
+            )
+        ).first()
+        assert updated_at_col is not None, (
+            "migration 006 omitted the inherited `updated_at` column — ORM "
+            "inserts will raise UndefinedColumnError on the migration-only path"
+        )
+        assert updated_at_col[1] == "NO", f"updated_at must be NOT NULL; got {updated_at_col[1]}"
+        assert updated_at_col[2] is not None and "utc" in updated_at_col[2].lower(), (
+            f"updated_at DEFAULT is {updated_at_col[2]!r} — expected now() AT TIME ZONE 'UTC'"
+        )
+
         # Verify the digest-lookup index exists.
         digest_idx = [
-            r
-            for r in rows
-            if "request_sha256" in r[1] and "idx_idempotency_request_sha256" in r[0]
+            r for r in rows if "request_sha256" in r[1] and "idx_idempotency_request_sha256" in r[0]
         ]
         assert len(digest_idx) == 1, (
             f"migration 006 did not create idx_idempotency_request_sha256; indexes: {rows}"
         )
+
+
+@pytest.mark.asyncio
+async def test_pg_migration_006_accepts_orm_insert(pg_session_factory, pg_seeded):
+    """r3: the migration-applied schema (dropped into place by pg_engine) must
+    accept a full ORM insert — the proof the r2 fixture masked. The r2
+    migration omitted ``id`` and ``updated_at`` (inherited from Base), so an
+    ORM insert raised ``UndefinedColumnError: column "id" does not exist`` on
+    the migration-only path. The r3 fixture replaces the create_all table with
+    the migration-applied table for every PG test, so this insert would fail
+    across the suite if the drift returned. This test asserts it succeeds.
+    """
+    key = f"orm-insert-test-{uuid.uuid4()}"
+    async with pg_session_factory() as db:
+        rec = IdempotencyRecord(
+            scope="enrollment",
+            idempotency_key=key,
+            request_sha256=hashlib.sha256(b"orm-insert-test").hexdigest(),
+            status="pending",
+        )
+        db.add(rec)
+        await db.commit()
+        # Read it back via db.get() — exercises the inherited ``id`` column
+        # as the ORM's row-identity key. The r2 migration-only schema would
+        # raise UndefinedColumnError here.
+        fetched = await db.get(IdempotencyRecord, ("enrollment", key))
+        assert fetched is not None
+        assert fetched.request_sha256 == rec.request_sha256
+        # created_at and updated_at are inherited from Base — the ORM fills
+        # them with datetime.utcnow() (Python-side); both must be present.
+        assert fetched.created_at is not None
+        assert fetched.updated_at is not None

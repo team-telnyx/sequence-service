@@ -274,3 +274,83 @@ async def test_unsupported_contract_version_rejected(client, seeded):
         json=req,
     )
     assert resp.status_code == 400
+
+
+# ── ReplyIntent contract (SV2-044 r3) ─────────────────────────────────────
+# The versioned reply-intent taxonomy lives in src/contracts.py (the contract
+# module the v2 compat test imports). These tests assert the SERVER side of
+# the contract — if the server enum diverges from the docs/10 spec, the test
+# fails here. The v2 side (tests/contract/test_sequence_contract_compat.py)
+# asserts the same spec from the client side. Together they prove both repos
+# agree — a divergent enum is a contract break that bites on at least one side.
+# This is NOT self-fulfilling: the expected set is the docs/10 spec
+# (hard-coded), not derived from the enum under test.
+
+import pytest as _pytest_spec  # noqa: E402
+from src.contracts import (  # noqa: E402
+    REPLY_INTENT_CONTRACT_VERSION as _SERVER_REPLY_INTENT_VERSION,
+    ReplyIntent as _ServerReplyIntent,
+)
+
+
+class TestReplyIntentContractServerSide:
+    """Server-side ReplyIntent contract — bites if the server enum diverges
+    from the docs/10 spec. The matching client-side test in
+    tests/contract/test_sequence_contract_compat.py bites if the v2 enum
+    diverges. Both sides must agree — a divergent enum breaks the contract
+    visibly on at least one side.
+    """
+
+    def test_reply_intent_contract_version_is_1(self) -> None:
+        assert _SERVER_REPLY_INTENT_VERSION == 1, (
+            f"server REPLY_INTENT_CONTRACT_VERSION is "
+            f"{_SERVER_REPLY_INTENT_VERSION!r}, expected 1 (docs/10 spec)"
+        )
+
+    def test_reply_intent_values_match_spec(self) -> None:
+        """The server enum values must match the docs/10 spec EXACTLY. The
+        expected set is hard-coded from the spec (not derived from the enum
+        under test) so the test is NOT self-fulfilling — adding/removing/renaming
+        a value fails the test loudly.
+        """
+        expected = {
+            "positive_interest",
+            "positive_meeting",
+            "negative_not_interested",
+            "negative_wrong_person",
+            "out_of_office",
+            "autoresponder",
+            "unsubscribe_request",
+            "unknown",
+        }
+        actual = {r.value for r in _ServerReplyIntent}
+        assert actual == expected, (
+            f"server ReplyIntent diverges from docs/10 spec: "
+            f"missing={expected - actual}, extra={actual - expected}"
+        )
+
+    def test_reply_intent_has_exactly_eight_values(self) -> None:
+        assert len(_ServerReplyIntent) == 8, (
+            f"server ReplyIntent has {len(_ServerReplyIntent)} values, expected 8 (docs/10 spec)"
+        )
+
+    def test_bounce_is_not_a_reply_intent(self) -> None:
+        """Bounce is structurally detected, NOT a reply intent. v1's poller
+        conflated bounce with REPLY (154/168 of the live backlog); the r3
+        ingest path classifies bounce DISTINCTLY via the is_bounce flag
+        BEFORE any ReplyIntent classification, and reply_intent stays NULL
+        for BOUNCE signals. This test asserts the enum itself does not
+        contain a bounce value — the structural separation is encoded at
+        the type level, not just the ingest call site.
+        """
+        values = {r.value for r in _ServerReplyIntent}
+        assert "bounce" not in values
+        assert "BOUNCE" not in values
+
+    def test_referral_is_not_a_reply_intent(self) -> None:
+        """Referral routing is out of scope (REVOPS-1458). The enum must not
+        contain a referral value — a future classifier that adds one would
+        break this assertion and force an explicit contract-version bump.
+        """
+        values = {r.value for r in _ServerReplyIntent}
+        assert "referral" not in values

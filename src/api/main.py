@@ -38,10 +38,35 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — explicit origins only; wildcard+credentials is a CSRF surface.
+# CORS — explicit origins only; wildcard+credentials is a CSRF surface (not_done_if).
 # Empty list = no CORS (fail-closed). CORS_ALLOWED_ORIGINS env var.
+#
+# SV2-044 r3 (not_done_if): the r2 builder constructed
+# ``CORSMiddleware(allow_origins=['*'], allow_credentials=True)`` when
+# ``CORS_ALLOWED_ORIGINS='["*"]'`` — wildcard origins + credentials is the
+# classic CSRF surface (browsers refuse it per the CORS spec, but
+# starlette's CORSMiddleware does NOT refuse it server-side — it emits the
+# ``Access-Control-Allow-Origin: *`` header with
+# ``Access-Control-Allow-Credentials: true``, which is a spec violation
+# AND a real CSRF surface if a future client coerces the response). The r3
+# guard makes the dangerous combination IMPOSSIBLE by construction:
+#   - if any configured origin is "*" → raise on invalid config (refuse to
+#     start). This is the fail-closed path — there is NO configuration that
+#     yields wildcard+credentials.
+# An operator who genuinely wants wildcard (no credentials) must explicitly
+# set ``allow_credentials=False`` via a future config knob; the default
+# remains "explicit origins only" so the dangerous combo cannot land by
+# accident.
 _cors_origins = list(settings.cors_allowed_origins)
 if _cors_origins:
+    # not_done_if: reject "*" — wildcard origins + credentials is a CSRF
+    # surface. Refuse to start so misconfiguration is loud, not silent.
+    if any(origin == "*" for origin in _cors_origins):
+        raise RuntimeError(
+            "CORS_ALLOWED_ORIGINS contains '*' — wildcard origins with "
+            "allow_credentials=True is a CSRF surface (not_done_if). "
+            "Configure explicit origins only."
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_origins,

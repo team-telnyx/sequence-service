@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from src.config import get_settings
+from src.contracts import ReplyIntent
 from src.models.base import async_session
 from src.models.models import (
     Mailbox,
@@ -40,9 +41,9 @@ def _gmail_call_locked(gmail, method, *args, **kwargs):
 async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
     """
     Poll a mailbox for engagement signals.
-    
+
     Detects: replies, bounces, out-of-office, unsubscribes.
-    
+
     1. Get recent inbox messages
     2. Match against our sent emails by thread_id
     3. Classify signal type
@@ -50,22 +51,20 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
     5. Update enrollment status as needed
     """
     logger.info("Detecting signals", mailbox_id=mailbox_id)
-    
+
     if not settings.gmail_enabled:
         logger.info("[STUB] Gmail disabled - skipping signal detection")
         return {"signals_detected": 0, "stub_mode": True}
-    
+
     async with async_session() as db:
         # Get mailbox
-        result = await db.execute(
-            select(Mailbox).where(Mailbox.id == mailbox_id)
-        )
+        result = await db.execute(select(Mailbox).where(Mailbox.id == mailbox_id))
         mailbox = result.scalar_one_or_none()
-        
+
         if not mailbox:
             logger.error("Mailbox not found", mailbox_id=mailbox_id)
             return {"error": "mailbox_not_found"}
-        
+
         # Get recent sent emails from this mailbox.
         # Window must be >= the longest sequence span (21 days) so a LATE reply
         # (e.g. 10 days after the touch that prompted it) is still matched to its
@@ -79,20 +78,21 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
                 SentEmail.sent_at >= cutoff,
             )
             .options(
-                selectinload(SentEmail.enrollment_step)
-                .selectinload(SequenceEnrollmentStep.enrollment)
+                selectinload(SentEmail.enrollment_step).selectinload(
+                    SequenceEnrollmentStep.enrollment
+                )
             )
         )
         sent_emails = result.scalars().all()
-        
+
         if not sent_emails:
             logger.info("No recent sent emails to check", mailbox_id=mailbox_id)
             return {"signals_detected": 0, "no_sent_emails": True}
-        
+
         # Build lookup by thread_id
         thread_to_sent = {se.thread_id: se for se in sent_emails if se.thread_id}
         thread_ids = list(thread_to_sent.keys())
-        
+
         # Incremental scan (Fix 3): skip threads that already have a TERMINAL
         # signal recorded (REPLY -> enrollment PAUSED, BOUNCE -> BOUNCED).
         # Re-fetching a terminal-signaled thread would only re-discover the
@@ -107,18 +107,19 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
         # "threads still awaiting a terminal outcome," not ~0.
         sent_email_ids = [se.id for se in sent_emails]
         recorded_result = await db.execute(
-            select(Signal.sent_email_id).where(
+            select(Signal.sent_email_id)
+            .where(
                 Signal.sent_email_id.in_(sent_email_ids),
                 Signal.type.in_([SignalType.REPLY, SignalType.BOUNCE]),
-            ).distinct()
+            )
+            .distinct()
         )
         recorded_sent_email_ids = {r[0] for r in recorded_result.all()}
         threads_to_fetch = [
-            tid for tid, se in thread_to_sent.items()
-            if se.id not in recorded_sent_email_ids
+            tid for tid, se in thread_to_sent.items() if se.id not in recorded_sent_email_ids
         ]
         threads_skipped = len(thread_ids) - len(threads_to_fetch)
-        
+
         logger.info(
             "Checking threads for replies",
             mailbox=mailbox.email,
@@ -126,7 +127,7 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
             threads_to_fetch=len(threads_to_fetch),
             threads_skipped_incremental=threads_skipped,
         )
-        
+
         if not threads_to_fetch:
             logger.info(
                 "All threads already have recorded signals -- skipping Gmail fetch",
@@ -139,7 +140,7 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
                 "replies_found": 0,
                 "threads_skipped_incremental": threads_skipped,
             }
-        
+
         # Poll Gmail for replies. Offload the blocking call to a worker thread
         # (Fix 1) so the event loop stays responsive for the other 9 arq jobs.
         # Acquire the per-mailbox lock (Fix 2) so two concurrent jobs on the
@@ -157,63 +158,87 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
         except GmailError as e:
             logger.error("Gmail API error", error=str(e))
             return {"error": str(e)}
-        
+
         signals_created = 0
-        
+
         for reply in replies:
-            thread_id = reply['thread_id']
+            thread_id = reply["thread_id"]
             sent_email = thread_to_sent.get(thread_id)
-            
+
             if not sent_email:
                 continue
-            
+
             # Check if we already recorded this signal
             existing = await db.execute(
-                select(Signal)
-                .where(
+                select(Signal).where(
                     Signal.sent_email_id == sent_email.id,
-                    Signal.raw_data.contains(reply['message_id']),
+                    Signal.raw_data.contains(reply["message_id"]),
                 )
             )
             if existing.scalar_one_or_none():
-                logger.debug("Signal already recorded", message_id=reply['message_id'])
+                logger.debug("Signal already recorded", message_id=reply["message_id"])
                 continue
-            
-            # Classify signal type
-            if reply.get('is_bounce'):
+
+            # Classify signal type AND versioned reply intent (SV2-044 r3).
+            #
+            # BOUNCE is classified STRUCTURALLY (Gmail is_bounce flag) and
+            # DISTINCTLY from REPLY — v1's poller conflated them (154/168 of
+            # the live backlog were mailer-daemon bounces recorded as REPLY).
+            # The structural is_bounce check happens FIRST; a bounce never
+            # falls through to the ReplyIntent classification. Bounce is NOT
+            # a ReplyIntent (it is a separate SignalType), so reply_intent
+            # stays NULL for BOUNCE signals.
+            #
+            # For REPLY signals, reply_intent is set to UNKNOWN by default —
+            # the deeper semantic classification (positive_interest,
+            # negative_not_interested, etc.) requires content analysis that
+            # is out of scope for this packet. The versioned enum is the
+            # contract for that future classifier to populate.
+            #
+            # For OUT_OF_OFFICE signals, reply_intent is set to OUT_OF_OFFICE
+            # (the enum has a matching value — OOO is a structural auto-reply
+            # distinct from a human REPLY).
+            if reply.get("is_bounce"):
                 signal_type = SignalType.BOUNCE
-            elif reply.get('is_ooo'):
+                reply_intent: ReplyIntent | None = None
+            elif reply.get("is_ooo"):
                 signal_type = SignalType.OUT_OF_OFFICE
+                reply_intent = ReplyIntent.OUT_OF_OFFICE
             else:
                 signal_type = SignalType.REPLY
-            
+                reply_intent = ReplyIntent.UNKNOWN
+
             # Create signal record
             signal = Signal(
-                id=str(__import__('uuid').uuid4()),
+                id=str(__import__("uuid").uuid4()),
                 sent_email_id=sent_email.id,
                 type=signal_type,
+                reply_intent=reply_intent,
                 detected_at=datetime.utcnow(),
-                raw_data=json.dumps({
-                    'gmail_message_id': reply['message_id'],
-                    'from': reply['from'],
-                    'subject': reply['subject'],
-                    'snippet': reply['snippet'],
-                    'date': reply['date'],
-                }),
+                raw_data=json.dumps(
+                    {
+                        "gmail_message_id": reply["message_id"],
+                        "from": reply["from"],
+                        "subject": reply["subject"],
+                        "snippet": reply["snippet"],
+                        "date": reply["date"],
+                    }
+                ),
             )
             db.add(signal)
             signals_created += 1
-            
+
             logger.info(
                 "Signal detected",
                 type=signal_type.value,
-                from_addr=reply['from'],
+                reply_intent=reply_intent.value if reply_intent else None,
+                from_addr=reply["from"],
                 sent_email_id=sent_email.id,
             )
-            
+
             # Update enrollment based on signal type
             enrollment = sent_email.enrollment_step.enrollment
-            
+
             if signal_type == SignalType.REPLY:
                 # Pause enrollment - they replied!
                 if enrollment.status == EnrollmentStatus.ACTIVE:
@@ -226,27 +251,27 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
                         "Paused enrollment due to reply",
                         enrollment_id=enrollment.id,
                     )
-            
+
             elif signal_type == SignalType.BOUNCE:
                 # Mark as bounced - stop sending
                 enrollment.status = EnrollmentStatus.BOUNCED
-                
+
                 # Cancel pending steps
                 for step in await _get_pending_steps(db, enrollment.id):
                     step.status = EnrollmentStepStatus.SKIPPED
-                
+
                 logger.info(
                     "Marked enrollment as bounced",
                     enrollment_id=enrollment.id,
                 )
-            
+
             elif signal_type == SignalType.OUT_OF_OFFICE:
                 # Just record it - don't change enrollment status
                 logger.info(
                     "Out-of-office detected (no action)",
                     enrollment_id=enrollment.id,
                 )
-            
+
             # Trigger webhook for all signal types
             try:
                 await create_signal_webhook(
@@ -257,15 +282,15 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
                 )
             except Exception as e:
                 logger.error("Failed to create signal webhook", error=str(e))
-        
+
         await db.commit()
-        
+
         logger.info(
             "Signal detection complete",
             mailbox=mailbox.email,
             signals_created=signals_created,
         )
-        
+
         return {
             "signals_detected": signals_created,
             "threads_checked": len(threads_to_fetch),
@@ -277,13 +302,14 @@ async def detect_signals(ctx: dict, mailbox_id: str, tenant_id: str) -> dict:
 async def _get_pending_steps(db, enrollment_id: str) -> list[SequenceEnrollmentStep]:
     """Get all pending/scheduled steps for an enrollment."""
     result = await db.execute(
-        select(SequenceEnrollmentStep)
-        .where(
+        select(SequenceEnrollmentStep).where(
             SequenceEnrollmentStep.enrollment_id == enrollment_id,
-            SequenceEnrollmentStep.status.in_([
-                EnrollmentStepStatus.PENDING,
-                EnrollmentStepStatus.SCHEDULED,
-            ]),
+            SequenceEnrollmentStep.status.in_(
+                [
+                    EnrollmentStepStatus.PENDING,
+                    EnrollmentStepStatus.SCHEDULED,
+                ]
+            ),
         )
     )
     return result.scalars().all()
@@ -292,30 +318,29 @@ async def _get_pending_steps(db, enrollment_id: str) -> list[SequenceEnrollmentS
 async def detect_signals_all_mailboxes(ctx: dict, tenant_id: str) -> dict:
     """
     Run signal detection for all active mailboxes in a tenant.
-    
+
     Convenience function for scheduled polling.
     """
     logger.info("Running signal detection for all mailboxes", tenant_id=tenant_id)
-    
+
     async with async_session() as db:
-        result = await db.execute(
-            select(Mailbox)
-            .where(Mailbox.tenant_id == tenant_id)
-        )
+        result = await db.execute(select(Mailbox).where(Mailbox.tenant_id == tenant_id))
         mailboxes = result.scalars().all()
-    
+
     total_signals = 0
     results = []
-    
+
     for mailbox in mailboxes:
         result = await detect_signals(ctx, mailbox.id, tenant_id)
-        results.append({
-            "mailbox_id": mailbox.id,
-            "mailbox_email": mailbox.email,
-            **result,
-        })
+        results.append(
+            {
+                "mailbox_id": mailbox.id,
+                "mailbox_email": mailbox.email,
+                **result,
+            }
+        )
         total_signals += result.get("signals_detected", 0)
-    
+
     return {
         "total_signals": total_signals,
         "mailboxes_checked": len(mailboxes),

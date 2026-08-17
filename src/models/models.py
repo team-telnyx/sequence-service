@@ -15,6 +15,7 @@ from sqlalchemy import (
     Integer,
     Boolean,
     Enum,
+    JSON,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -459,5 +460,9 @@ class IdempotencyRecord(Base):
     idempotency_key: Mapped[str] = mapped_column(String(500), primary_key=True)
     request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False)
-    result: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # JSONB on PostgreSQL (matches migration 006 + drift checker); JSON on SQLite
+    # so Base.metadata.create_all() renders in the existing SQLite test fixtures.
+    result: Mapped[Optional[dict]] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), nullable=True
+    )
     completed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)

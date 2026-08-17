@@ -20,6 +20,7 @@ cannot corrupt scheduling/capacity logic.
 """
 
 import os
+import re
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -212,25 +213,123 @@ _PG_CREATE_SUPPRESSION_REASON_ENUM = (
     ")"
 )
 
-# Migration 006 — applied AFTER create_all drops the ORM-created
-# idempotency_records (which has Python-side defaults only) and recreates it
-# with the production server-side DEFAULT (now() AT TIME ZONE 'UTC') on
-# created_at. This is the schema the naive-UTC integration assertion verifies.
-_PG_MIGRATION_006_PATH = (
-    Path(__file__).resolve().parent.parent / "migrations" / "006_idempotency_records_sv2_044.sql"
+# SV2-044 r4 (FAIL 3): pre-create the reply_intent enum before create_all.
+# The ORM declares Enum(ReplyIntent, values_callable=..., name="reply_intent",
+# create_type=False) — create_type=False means SQLAlchemy will NOT emit a
+# CREATE TYPE during create_all (migration 007 owns it), so the type must
+# already exist or CREATE TABLE signals fails on a fresh PG DB. All 8
+# docs/10 values (lowercase, matching migration 007's CREATE TYPE).
+_PG_CREATE_REPLY_INTENT_ENUM = (
+    "CREATE TYPE reply_intent AS ENUM ("
+    "  'positive_interest', 'positive_meeting', 'negative_not_interested',"
+    "  'negative_wrong_person', 'out_of_office', 'autoresponder',"
+    "  'unsubscribe_request', 'unknown'"
+    ")"
 )
+
+# SV2-044 r4 (FAIL 3): apply ALL migrations 001-007 (not just 006). The r3
+# fixture applied only 006 standalone — that masked drift between the ORM
+# and the other migrations (e.g. 007's reply_intent enum values diverging
+# from the ORM's emission). r4 applies every migration in order against the
+# create_all schema so any drift surfaces on the very next ORM insert.
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+_MIGRATIONS_IN_ORDER = [
+    "001_scout_only_collapse.sql",
+    "002_mailbox_transport.sql",
+    "003_enrollment_step_failed_status.sql",
+    "004_suppression_api_reasons.sql",
+    "005_sent_email_delivered_at.sql",
+    "006_idempotency_records_sv2_044.sql",
+    "007_signals_reply_intent_sv2_044.sql",
+]
+
+# Migration 006 — kept for the standalone test
+# (test_sv2_044_pg_contract.test_pg_migration_006_schema_standalone).
+_PG_MIGRATION_006_PATH = _MIGRATIONS_DIR / "006_idempotency_records_sv2_044.sql"
 
 
 def _split_sql_statements(sql_text: str) -> list[str]:
-    """Split a SQL script into individual statements for asyncpg (which rejects
-    multi-statement prepared statements). Naive split on ';' at the top level —
-    sufficient for the migration files in this repo (no semicolons inside string
-    literals or function bodies in 006). Strips comments and whitespace.
+    """Split a SQL script into individual statements for execution.
+
+    SV2-044 r4 (FAIL 3): the r3 splitter was a naive split on ';' — sufficient
+    for migration 006 (no DO blocks) but it BREAKS migrations 001-005 which
+    contain ``DO $$ ... END $$`` blocks with semicolons inside the function
+    body. r4 adds proper handling for:
+      - ``$$`` and ``$tag$`` dollar-quoted strings (may contain ';')
+      - ``'...'`` single-quoted strings with ``''`` escape (may contain ';')
+      - ``--`` line comments (may contain ';')
+    so a ';' inside a DO block / string / comment does NOT split the
+    statement. Strips full-line ``--`` comments from each statement;
+    inline comments are preserved (PG handles them).
     """
     statements: list[str] = []
-    for raw in sql_text.split(";"):
-        stmt = raw.strip()
-        # Drop full-line comment lines but keep inline comments (PG handles them).
+    current: list[str] = []
+    i = 0
+    n = len(sql_text)
+    while i < n:
+        # Line comment — skip to end of line (a ';' inside does not split).
+        if sql_text[i : i + 2] == "--":
+            eol = sql_text.find("\n", i)
+            if eol == -1:
+                current.append(sql_text[i:])
+                i = n
+            else:
+                current.append(sql_text[i : eol + 1])
+                i = eol + 1
+            continue
+
+        # Dollar-quoted string: $tag$ ... $tag$ (tag may be empty: $$).
+        if sql_text[i] == "$":
+            m = re.match(r"\$[A-Za-z_0-9]*\$", sql_text[i:])
+            if m:
+                tag = m.group()
+                current.append(tag)
+                i += len(tag)
+                close = sql_text.find(tag, i)
+                if close == -1:
+                    # Unterminated — append the rest verbatim.
+                    current.append(sql_text[i:])
+                    i = n
+                else:
+                    current.append(sql_text[i:close])
+                    current.append(tag)
+                    i = close + len(tag)
+                continue
+
+        # Single-quoted string: '...' with '' as escape.
+        if sql_text[i] == "'":
+            current.append("'")
+            i += 1
+            while i < n:
+                if sql_text[i] == "'":
+                    if i + 1 < n and sql_text[i + 1] == "'":
+                        current.append("''")
+                        i += 2
+                    else:
+                        current.append("'")
+                        i += 1
+                        break
+                else:
+                    current.append(sql_text[i])
+                    i += 1
+            continue
+
+        ch = sql_text[i]
+        if ch == ";":
+            stmt = "".join(current).strip()
+            if stmt:
+                lines = [line for line in stmt.splitlines() if not line.strip().startswith("--")]
+                cleaned = "\n".join(lines).strip()
+                if cleaned:
+                    statements.append(cleaned)
+            current = []
+            i += 1
+        else:
+            current.append(ch)
+            i += 1
+
+    stmt = "".join(current).strip()
+    if stmt:
         lines = [line for line in stmt.splitlines() if not line.strip().startswith("--")]
         cleaned = "\n".join(lines).strip()
         if cleaned:
@@ -275,23 +374,29 @@ async def _pg_db_url():
 async def pg_engine(_pg_db_url):
     """Fresh PG engine per test. Schema mirrors the production path: the app's
     lifespan hook runs Base.metadata.create_all on startup, so the fixture does
-    the same — EXCEPT for ``idempotency_records``. That table is the SV2-044
-    migration-owned table, and the r2 fixture masked a real drift by doing
-    ``create_all + ALTER COLUMN ... SET DEFAULT`` (the migration's
-    ``CREATE TABLE IF NOT EXISTS`` was a no-op against the create_all table,
-    so a migration that omitted a column the ORM has would still pass every
-    test — exactly the masked-defect failure mode an independent reviewer on
-    real PostgreSQL caught: ``UndefinedColumnError: column "id" does not
-    exist`` on the migration-only path).
+    the same — THEN applies ALL migrations 001-007 in order so the
+    migration-applied schema matches what a real PostgreSQL deploy gets.
 
-    r3 fix: the fixture drops the create_all ``idempotency_records`` and
-    applies migration 006's SQL standalone (the same path
-    ``test_pg_migration_006_schema_standalone`` exercises). Now every PG test
-    that touches the table runs against the MIGRATION-APPLIED schema — if the
-    migration and ORM drift again, the very next ORM insert/eager-load fails
-    loudly across the suite, not just in one standalone test. The
-    suppression_reason enum is still pre-created (the ORM marks it
-    create_type=False — the migration owns it).
+    SV2-044 r4 (FAIL 3): the r3 fixture applied ONLY migration 006 standalone
+    — that masked drift between the ORM and the other migrations (e.g. 007's
+    reply_intent enum values diverging from the ORM's emission). The r3
+    ORM ``Enum(ReplyIntent, name="reply_intent", create_type=False)`` emitted
+    the enum MEMBER NAMES (uppercase) by default, NOT the ``.value``
+    (lowercase docs/10 strings), so an ORM insert of a Signal with a
+    reply_intent raised ``InvalidTextRepresentationError: invalid input
+    value for enum reply_intent: "UNKNOWN"`` against the migration-applied
+    schema. r4:
+      - The ORM column now uses ``values_callable`` so SQLAlchemy emits
+        ``.value`` (matching migration 007's lowercase labels).
+      - The fixture applies ALL migrations 001-007 (not just 006) so any
+        drift between the ORM and ANY migration surfaces on the very next
+        ORM insert — not just the one migration a standalone test exercises.
+      - The ``reply_intent`` enum is pre-created (like ``suppression_reason``)
+        so ``create_all`` can create the ``signals`` table with the
+        ``reply_intent`` column referencing the type. Migration 007's
+        ``CREATE TYPE`` then re-creates it (the fixture drops the
+        pre-created type + column first so the migration owns them, same
+        pattern as 006 for ``idempotency_records``).
 
     The DB is session-scoped (one disposable DB per pytest session) but the
     schema is fully reset per test via DROP SCHEMA CASCADE so every test starts
@@ -309,22 +414,36 @@ async def pg_engine(_pg_db_url):
         await conn.execute(text("CREATE SCHEMA public"))
         # Pre-create the suppression_reason enum (create_type=False in the model).
         await conn.execute(text(_PG_CREATE_SUPPRESSION_REASON_ENUM))
+        # r4: pre-create the reply_intent enum (create_type=False in the model —
+        # migration 007 owns it). All 8 docs/10 lowercase values, matching
+        # migration 007's CREATE TYPE. create_all can then create the signals
+        # table with the reply_intent column referencing this type.
+        await conn.execute(text(_PG_CREATE_REPLY_INTENT_ENUM))
         # Create all tables per the ORM — this is what the app's lifespan does
         # in production (src/api/main.py lifespan -> Base.metadata.create_all).
         # The other enum types (mailboxstatus, sequencestatus, etc.) are created
         # automatically since they use create_type=True by default.
         await conn.run_sync(Base.metadata.create_all)
-        # SV2-044 r3: replace the create_all idempotency_records with the
-        # MIGRATION-APPLIED schema. The migration is the schema-of-record for
-        # production; create_all is the app's bootstrap convenience. If they
-        # drift, the migration loses (production deploy applies the migration,
-        # not create_all), so the fixture must run against the migration schema
-        # to catch the drift — not mask it with create_all + ALTER. The r2
-        # fixture masked exactly the r3 reviewer defect (missing ``id`` /
-        # ``updated_at``) this way.
+        # r4: drop the create_all versions of migration-owned objects so the
+        # migrations are the schema-of-record (production deploy applies the
+        # migrations, not create_all). The fixture then re-applies ALL
+        # migrations 001-007 in order. If a migration and the ORM drift, the
+        # migration wins (production deploy applies the migration, not
+        # create_all), so the fixture must run against the migration schema
+        # to catch the drift — not mask it with create_all.
         await conn.execute(text("DROP TABLE IF EXISTS idempotency_records"))
-        for stmt in _split_sql_statements(_PG_MIGRATION_006_PATH.read_text()):
-            await conn.execute(text(stmt))
+        # Drop the create_all reply_intent column + type so migration 007's
+        # CREATE TYPE + ADD COLUMN re-create them (proves the migration owns
+        # the type + column, not create_all).
+        await conn.execute(text("ALTER TABLE signals DROP COLUMN IF EXISTS reply_intent"))
+        await conn.execute(text("DROP TYPE IF EXISTS reply_intent"))
+        # r4: apply ALL migrations 001-007 in order. The smarter
+        # _split_sql_statements handles $$ DO blocks in 001-005 (the r3
+        # naive split-on-; broke on these).
+        for mig_name in _MIGRATIONS_IN_ORDER:
+            mig_path = _MIGRATIONS_DIR / mig_name
+            for stmt in _split_sql_statements(mig_path.read_text()):
+                await conn.execute(text(stmt))
     yield eng
     await eng.dispose()
 

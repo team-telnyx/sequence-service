@@ -9,8 +9,6 @@ Tests the docs/10 §Sequence enrollment contract:
 """
 
 import asyncio
-import hashlib
-import json
 import uuid
 from unittest.mock import AsyncMock
 
@@ -22,14 +20,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.api.main import app
 from src.models.base import Base, get_db
 from src.models.models import (
-    IdempotencyRecord,
     Mailbox,
     MailboxStatus,
     SequenceEnrollment,
-    SequenceEnrollmentStep,
-    Sequence,
-    SequenceStatus,
-    SequenceStep,
     Tenant,
 )
 
@@ -286,7 +279,6 @@ async def test_unsupported_contract_version_rejected(client, seeded):
 # This is NOT self-fulfilling: the expected set is the docs/10 spec
 # (hard-coded), not derived from the enum under test.
 
-import pytest as _pytest_spec  # noqa: E402
 from src.contracts import (  # noqa: E402
     REPLY_INTENT_CONTRACT_VERSION as _SERVER_REPLY_INTENT_VERSION,
     ReplyIntent as _ServerReplyIntent,

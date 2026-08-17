@@ -20,7 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from src.contracts import REPLY_INTENT_CONTRACT_VERSION, ReplyIntent
+from src.contracts import ReplyIntent
 from src.models.base import Base
 
 
@@ -279,8 +279,29 @@ class Signal(Base):
     # OUT_OF_OFFICE (OUT_OF_OFFICE). NULL for BOUNCE (bounce is NOT a
     # ReplyIntent — it is structurally detected and handled as a separate
     # SignalType) and for non-reply signals (OPEN/CLICK/UNSUBSCRIBE).
+    #
+    # SV2-044 r4 (FAIL 3): ``values_callable`` makes SQLAlchemy emit the
+    # enum ``.value`` (lowercase docs/10 strings: "positive_interest", etc.)
+    # for BOTH the column type's allowed labels AND the bind parameters —
+    # matching migration 007's ``CREATE TYPE reply_intent AS ENUM (...)``
+    # values. The r3 column used ``Enum(ReplyIntent, name="reply_intent",
+    # create_type=False)`` WITHOUT ``values_callable`` → SQLAlchemy emits
+    # the enum MEMBER NAMES (uppercase: "POSITIVE_INTEREST", etc.) by
+    # default, NOT the ``.value`` → an ORM insert raised
+    # ``InvalidTextRepresentationError: invalid input value for enum
+    # reply_intent: "UNKNOWN"`` because the DB type's labels (lowercase)
+    # didn't match the bound values (uppercase). r4 aligns them ONE
+    # canonical way (the docs/10 lowercase values) via ``values_callable``
+    # so the DB enum labels, the SQLAlchemy emission, and
+    # ``ReplyIntent.value`` are all identical. Bounce stays OUT of the
+    # enum (structurally classified, reply_intent=None).
     reply_intent: Mapped[Optional[ReplyIntent]] = mapped_column(
-        Enum(ReplyIntent, name="reply_intent", create_type=False),
+        Enum(
+            ReplyIntent,
+            values_callable=lambda e: [m.value for m in e],
+            name="reply_intent",
+            create_type=False,
+        ),
         nullable=True,
     )
     detected_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
@@ -383,11 +404,13 @@ class ProcessedEmailEvent(Base):
     processed_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
 
-# ReplyIntent + REPLY_INTENT_CONTRACT_VERSION are re-exported from src.contracts
-# (the canonical contract module) for back-compat with callers that imported
-# them from models. SV2-044 r3: the canonical definition lives in contracts.py
-# so the contract-compat test can bite on a divergent server enum.
-__all_re_exports__ = ["ReplyIntent", "REPLY_INTENT_CONTRACT_VERSION"]
+# ReplyIntent is re-exported from src.contracts (the canonical contract
+# module) for back-compat with callers that imported it from models. SV2-044
+# r3: the canonical definition lives in contracts.py so the contract-compat
+# test can bite on a divergent server enum. SV2-044 r4: REPLY_INTENT_CONTRACT_VERSION
+# is NO LONGER re-exported from models — import it from src.contracts directly
+# (nothing in this repo imports it from models; the re-export was unused).
+__all_re_exports__ = ["ReplyIntent"]
 
 
 class IdempotencyRecord(Base):

@@ -17,10 +17,8 @@ No double enrollment/send is possible under repeated or concurrent requests.
 from __future__ import annotations
 
 import hashlib
-import json
 import uuid
 from datetime import datetime
-from typing import Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -38,13 +36,10 @@ from src.contracts import (
 from src.models.base import get_db
 from src.models.models import (
     IdempotencyRecord,
-    Mailbox,
-    MailboxStatus,
     Sequence,
     SequenceEnrollment,
     SequenceEnrollmentStep,
     SequenceStatus,
-    EnrollmentStatus,
     EnrollmentStepStatus,
 )
 from src.services.mailbox_rotation import select_mailbox
@@ -283,6 +278,79 @@ async def create_versioned_enrollment(
             enrollment_id=enrollment.id,
             idempotency_key=key,
             capacity_date=capacity_date,
+            reason_code=None,
+        ).model_dump(),
+    )
+
+
+# SV2-044 r4 (FAIL 2): GET-lookup endpoint for timeout reconciliation.
+# The v2 enrollment client GETs this BEFORE any retry-POST — a read, not a
+# POST. If the lookup shows an existing enrollment (200), the client returns
+# it (no POST). If 404 (no prior attempt landed), the client retries the
+# POST. The r3 client re-POSTed on timeout (labelled a "lookup" but actually
+# a second POST) — LOOKUP_BEFORE_RETRY=False. r4 is the real reconciliation.
+@router.get("/enrollments/by-idempotency-key/{key}")
+async def lookup_enrollment_by_idempotency_key(
+    key: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Lookup an enrollment by idempotency key (SV2-044 r4, FAIL 2).
+
+    A READ endpoint for timeout reconciliation: the v2 client GETs this
+    BEFORE retrying a POST (``LOOKUP_BEFORE_RETRY=True``).
+
+    Returns:
+      - 200 with ``EnrollmentResponse(status=EXISTING, enrollment_id,
+        capacity_date)`` if the idempotency record is found and completed
+        (the prior attempt landed and finished).
+      - 200 with ``EnrollmentResponse(status=EXISTING, enrollment_id=None,
+        reason_code="sequence.idempotency_pending")`` if the record is
+        found but pending (the prior attempt crashed/timed out before
+        completing — the client retries to get the completed id).
+      - 404 if no record exists for the key (the prior attempt did not
+        land — the client retries the POST via ``enroll``).
+    """
+    record_q = await db.execute(
+        select(IdempotencyRecord).where(
+            IdempotencyRecord.scope == IDEMPOTENCY_SCOPE,
+            IdempotencyRecord.idempotency_key == key,
+        )
+    )
+    rec = record_q.scalar_one_or_none()
+    if rec is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "contract_version": ENROLLMENT_CONTRACT_VERSION,
+                "idempotency_key": key,
+                "detail": "no enrollment found for this idempotency key",
+            },
+        )
+
+    result = rec.result
+    if rec.status == "pending" or result is None:
+        # Prior attempt still in progress (crashed/timed out) — return
+        # existing with no enrollment_id yet; caller retries to get completed.
+        return JSONResponse(
+            status_code=200,
+            content=EnrollmentResponse(
+                contract_version=ENROLLMENT_CONTRACT_VERSION,
+                status=EnrollmentStatusContract.EXISTING,
+                enrollment_id=None,
+                idempotency_key=key,
+                capacity_date=None,
+                reason_code="sequence.idempotency_pending",
+            ).model_dump(),
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content=EnrollmentResponse(
+            contract_version=ENROLLMENT_CONTRACT_VERSION,
+            status=EnrollmentStatusContract.EXISTING,
+            enrollment_id=result.get("enrollment_id"),
+            idempotency_key=key,
+            capacity_date=result.get("capacity_date"),
             reason_code=None,
         ).model_dump(),
     )

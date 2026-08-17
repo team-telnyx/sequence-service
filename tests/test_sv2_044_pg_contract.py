@@ -27,8 +27,7 @@ still run on the in-memory SQLite fixture for the fast unit path.
 import asyncio
 import hashlib
 import uuid
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime
 
 import pytest
 from sqlalchemy import func, select, text
@@ -36,7 +35,6 @@ from sqlalchemy import func, select, text
 from src.models.models import (
     IdempotencyRecord,
     SequenceEnrollment,
-    SequenceEnrollmentStep,
     SequenceStep,
     Sequence,
     SequenceStatus,
@@ -243,9 +241,8 @@ async def test_pg_naive_utc_scheduled_at_resists_host_tz_skew(pg_session_factory
 
         from src.models.models import (
             SequenceEnrollment,
+            SequenceEnrollmentStep,
             Mailbox,
-            MailboxStatus,
-            EnrollmentStatus,
             EnrollmentStepStatus,
         )
 
@@ -289,7 +286,7 @@ async def test_pg_naive_utc_scheduled_at_resists_host_tz_skew(pg_session_factory
                     # code used bare now() as the default, stored would match
                     # this; the assertion proves it does NOT.
                     "now()::timestamp AS session_now "
-                    f"FROM sequence_enrollment_steps WHERE id = :sid"
+                    "FROM sequence_enrollment_steps WHERE id = :sid"
                 ),
                 {"sid": step_id},
             )
@@ -627,3 +624,213 @@ async def test_pg_migration_006_accepts_orm_insert(pg_session_factory, pg_seeded
         # them with datetime.utcnow() (Python-side); both must be present.
         assert fetched.created_at is not None
         assert fetched.updated_at is not None
+
+
+# ── SV2-044 r4 (FAIL 3): every ReplyIntent member inserts/reads on the
+#    migration-applied PG schema ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pg_every_reply_intent_member_inserts_and_reads_on_migration_schema(
+    pg_session_factory, pg_seeded
+):
+    """The load-bearing FAIL 3 proof: an ORM insert of a Signal with EACH
+    ReplyIntent member succeeds against the MIGRATION-APPLIED schema (all
+    migrations 001-007 applied by the pg_engine fixture) AND reads back with
+    the same member. SV2-044 r3 raised
+    ``InvalidTextRepresentationError: invalid input value for enum
+    reply_intent: "UNKNOWN"`` because the ORM ``Enum(ReplyIntent)`` emitted
+    the enum MEMBER NAMES (uppercase) by default, but migration 007's
+    ``CREATE TYPE reply_intent AS ENUM (...)`` used the lowercase ``.value``
+    strings — a DB/ORM drift the r3 fixture masked by applying only migration
+    006 standalone. r4 applies ALL migrations 001-007 AND the ORM column now
+    uses ``values_callable`` so SQLAlchemy emits ``.value`` (matching the
+    migration's labels). This test exercises every member so any future drift
+    (a new member, a renamed value, a migration that changes the type)
+    surfaces loudly.
+    """
+    from src.contracts import ReplyIntent
+    from src.models.models import (
+        Mailbox,
+        Sequence,
+        SequenceEnrollment,
+        SequenceEnrollmentStep,
+        SequenceStatus,
+        SequenceStep,
+        SentEmail,
+        Signal,
+        SignalType,
+    )
+
+    # Signal FK-requires SentEmail -> SequenceEnrollmentStep -> SequenceEnrollment
+    # -> Sequence -> SequenceStep + Mailbox. Tenant+Mailbox come from pg_seeded.
+    async with pg_session_factory() as db:
+        seq = Sequence(
+            id=str(uuid.uuid4()),
+            tenant_id=SCOUT_TENANT_ID,
+            name="reply-intent-test",
+            status=SequenceStatus.ACTIVE,
+        )
+        db.add(seq)
+        await db.flush()
+        step = SequenceStep(
+            id=str(uuid.uuid4()),
+            sequence_id=seq.id,
+            step_number=1,
+            subject="Hi",
+            body="Body",
+        )
+        db.add(step)
+        await db.flush()
+        mb = await db.get(Mailbox, "mb-active")
+        assert mb is not None
+        enrollment = SequenceEnrollment(
+            id=str(uuid.uuid4()),
+            sequence_id=seq.id,
+            mailbox_id=mb.id,
+            contact_email="reply-intent-test@scout-v2.local",
+            external_ref="reply-intent-contact",
+        )
+        db.add(enrollment)
+        await db.flush()
+        enrollment_step = SequenceEnrollmentStep(
+            id=str(uuid.uuid4()),
+            enrollment_id=enrollment.id,
+            step_id=step.id,
+            mailbox_id=mb.id,
+        )
+        db.add(enrollment_step)
+        await db.flush()
+        sent_email = SentEmail(
+            id=str(uuid.uuid4()),
+            message_id="reply-intent-test-msg-1",
+            mailbox_id=mb.id,
+            enrollment_step_id=enrollment_step.id,
+            subject="Hi",
+            body="Body",
+            to_email="prospect@example.com",
+            from_email="quinn.c@telnyx.com",
+        )
+        db.add(sent_email)
+        await db.flush()
+
+        sent_email_id = sent_email.id
+        inserted: dict[str, str] = {}
+        for member in ReplyIntent:
+            sig = Signal(
+                id=str(uuid.uuid4()),
+                sent_email_id=sent_email_id,
+                type=SignalType.REPLY,
+                reply_intent=member,
+            )
+            db.add(sig)
+            await db.flush()
+            inserted[member.name] = sig.id
+        await db.commit()
+
+    async with pg_session_factory() as db:
+        for member in ReplyIntent:
+            row_id = inserted[member.name]
+            fetched = await db.get(Signal, row_id)
+            assert fetched is not None, f"Signal for {member.name} not found"
+            assert fetched.reply_intent is member, (
+                f"reply_intent round-trip failed for {member.name}: "
+                f"inserted {member!r}, read back {fetched.reply_intent!r}"
+            )
+            assert fetched.reply_intent.value == member.value, (
+                f"reply_intent .value mismatch for {member.name}: "
+                f"expected {member.value!r}, got {fetched.reply_intent.value!r}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_pg_null_reply_intent_inserts_on_non_reply_signal(pg_session_factory, pg_seeded):
+    """Non-reply signals (BOUNCE/OPEN/CLICK/UNSUBSCRIBE) carry reply_intent=NULL
+    — bounce is structurally detected (NOT a ReplyIntent), and OPEN/CLICK/
+    UNSUBSCRIBE don't carry a reply intent. Prove a NULL reply_intent inserts
+    and reads back as None on the migration-applied schema (the r3 drift
+    would have surfaced here too if the column type was wrong, but the
+    member-name vs value mismatch only fires on non-NULL inserts).
+    """
+    from src.models.models import (
+        Mailbox,
+        Sequence,
+        SequenceEnrollment,
+        SequenceEnrollmentStep,
+        SequenceStatus,
+        SequenceStep,
+        SentEmail,
+        Signal,
+        SignalType,
+    )
+
+    async with pg_session_factory() as db:
+        seq = Sequence(
+            id=str(uuid.uuid4()),
+            tenant_id=SCOUT_TENANT_ID,
+            name="null-reply-intent-test",
+            status=SequenceStatus.ACTIVE,
+        )
+        db.add(seq)
+        await db.flush()
+        step = SequenceStep(
+            id=str(uuid.uuid4()),
+            sequence_id=seq.id,
+            step_number=1,
+            subject="Hi",
+            body="Body",
+        )
+        db.add(step)
+        await db.flush()
+        mb = await db.get(Mailbox, "mb-active")
+        assert mb is not None
+        enrollment = SequenceEnrollment(
+            id=str(uuid.uuid4()),
+            sequence_id=seq.id,
+            mailbox_id=mb.id,
+            contact_email="null-ri-test@scout-v2.local",
+            external_ref="null-ri-contact",
+        )
+        db.add(enrollment)
+        await db.flush()
+        enrollment_step = SequenceEnrollmentStep(
+            id=str(uuid.uuid4()),
+            enrollment_id=enrollment.id,
+            step_id=step.id,
+            mailbox_id=mb.id,
+        )
+        db.add(enrollment_step)
+        await db.flush()
+        sent_email = SentEmail(
+            id=str(uuid.uuid4()),
+            message_id="null-ri-test-msg-1",
+            mailbox_id=mb.id,
+            enrollment_step_id=enrollment_step.id,
+            subject="Hi",
+            body="Body",
+            to_email="prospect@example.com",
+            from_email="quinn.c@telnyx.com",
+        )
+        db.add(sent_email)
+        await db.flush()
+
+        # BOUNCE signal: reply_intent is NULL (bounce is structurally detected,
+        # NOT a ReplyIntent — the r3 contract separation).
+        bounce_sig = Signal(
+            id=str(uuid.uuid4()),
+            sent_email_id=sent_email.id,
+            type=SignalType.BOUNCE,
+            reply_intent=None,
+        )
+        db.add(bounce_sig)
+        await db.flush()
+        bounce_id = bounce_sig.id
+        await db.commit()
+
+    async with pg_session_factory() as db:
+        fetched = await db.get(Signal, bounce_id)
+        assert fetched is not None
+        assert fetched.reply_intent is None, (
+            f"BOUNCE signal reply_intent must be NULL; got {fetched.reply_intent!r}"
+        )
+        assert fetched.type is SignalType.BOUNCE

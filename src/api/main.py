@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 import logging
 
 from src.config import get_settings
-from src.models.base import engine, Base, async_session
+from src.models.base import engine, Base, async_session  # noqa: F401
 from src.api import (
     enrollments,
     sequences,

@@ -199,41 +199,19 @@ PG_ADMIN_DSN = os.environ.get(
     "SEQUENCE_TEST_ADMIN_URL", "postgresql://kevinward@localhost:5432/postgres"
 )
 
-# SQL to pre-create the suppression_reason enum type before Base.metadata.create_all
-# runs. The ORM declares Enum(SuppressionReason, name="suppression_reason",
-# create_type=False) — create_type=False means SQLAlchemy will NOT emit a
-# CREATE TYPE for it during create_all (the migration owns it), so the type
-# must already exist or CREATE TABLE suppressions fails on a fresh PG DB.
-# All 7 values (4 base + 3 from migration 004) are created up front so create_all
-# and the migration-applied schema agree.
-_PG_CREATE_SUPPRESSION_REASON_ENUM = (
-    "CREATE TYPE suppression_reason AS ENUM ("
-    "  'UNSUBSCRIBE', 'BOUNCE', 'COMPLAINT', 'MANUAL',"
-    "  'API_BOUNCE', 'API_COMPLAINT', 'API_UNSUBSCRIBE'"
-    ")"
-)
-
-# SV2-044 r4 (FAIL 3): pre-create the reply_intent enum before create_all.
-# The ORM declares Enum(ReplyIntent, values_callable=..., name="reply_intent",
-# create_type=False) — create_type=False means SQLAlchemy will NOT emit a
-# CREATE TYPE during create_all (migration 007 owns it), so the type must
-# already exist or CREATE TABLE signals fails on a fresh PG DB. All 8
-# docs/10 values (lowercase, matching migration 007's CREATE TYPE).
-_PG_CREATE_REPLY_INTENT_ENUM = (
-    "CREATE TYPE reply_intent AS ENUM ("
-    "  'positive_interest', 'positive_meeting', 'negative_not_interested',"
-    "  'negative_wrong_person', 'out_of_office', 'autoresponder',"
-    "  'unsubscribe_request', 'unknown'"
-    ")"
-)
-
-# SV2-044 r4 (FAIL 3): apply ALL migrations 001-007 (not just 006). The r3
-# fixture applied only 006 standalone — that masked drift between the ORM
-# and the other migrations (e.g. 007's reply_intent enum values diverging
-# from the ORM's emission). r4 applies every migration in order against the
-# create_all schema so any drift surfaces on the very next ORM insert.
+# SV2-044 r5 (FAIL 2): pure-migration PG fixture — NO create_all.
+# The r4 fixture ran Base.metadata.create_all then dropped+re-applied only
+# the SV2-044 tables. That hybrid masked migration/ORM drift in other tables
+# (transport, delivered_at, external_ref, enum values) because create_all
+# created the ORM version and the migrations' ADD COLUMN IF NOT EXISTS was a
+# no-op. r5 adds a baseline migration 000_baseline.sql that creates the
+# pre-migration base schema (everything create_all would produce for tables
+# NOT covered by 001-007), so the full chain 000->007 reproduces the COMPLETE
+# schema with NO create_all. A drift assertion compares the final schema to
+# the ORM metadata so any future ORM/migration divergence fails loudly.
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 _MIGRATIONS_IN_ORDER = [
+    "000_baseline.sql",
     "001_scout_only_collapse.sql",
     "002_mailbox_transport.sql",
     "003_enrollment_step_failed_status.sql",
@@ -318,7 +296,11 @@ def _split_sql_statements(sql_text: str) -> list[str]:
         if ch == ";":
             stmt = "".join(current).strip()
             if stmt:
-                lines = [line for line in stmt.splitlines() if not line.strip().startswith("--")]
+                lines = [
+                    line
+                    for line in stmt.splitlines()
+                    if not line.strip().startswith("--")
+                ]
                 cleaned = "\n".join(lines).strip()
                 if cleaned:
                     statements.append(cleaned)
@@ -330,11 +312,145 @@ def _split_sql_statements(sql_text: str) -> list[str]:
 
     stmt = "".join(current).strip()
     if stmt:
-        lines = [line for line in stmt.splitlines() if not line.strip().startswith("--")]
+        lines = [
+            line for line in stmt.splitlines() if not line.strip().startswith("--")
+        ]
         cleaned = "\n".join(lines).strip()
         if cleaned:
             statements.append(cleaned)
     return statements
+
+
+# SV2-044 r5 (FAIL 2): drift assertion — compares the migration-derived schema
+# to the ORM metadata so any future ORM/migration divergence fails loudly.
+# Compares column names, PG types, nullability, and enum value sets. Does NOT
+# compare constraint/index names (they differ between create_all naming
+# convention and migration explicit names) — only semantic structure.
+
+# ORM type → expected PG data_type (information_schema.columns.data_type).
+# Enum columns show as 'USER-DEFINED' with udt_name = the enum type name.
+_ORM_TYPE_TO_PG = {
+    "VARCHAR": {"character varying"},
+    "TEXT": {"text"},
+    "INTEGER": {"integer"},
+    "BOOLEAN": {"boolean"},
+    "JSON": {"json", "jsonb"},
+    "TIMESTAMP": {"timestamp without time zone"},
+}
+
+# Enum type name → expected values (after migrations 000..007 applied).
+# mailboxstatus/sequencestatus/etc. use MEMBER NAMES (uppercase).
+# reply_intent uses .value (lowercase, via values_callable).
+# suppression_reason: 4 base + 3 from migration 004.
+# enrollmentstepstatus: 5 base + 1 (FAILED) from migration 003.
+_EXPECTED_ENUM_VALUES = {
+    "mailboxstatus": {"ACTIVE", "PAUSED", "WARMING", "DISABLED"},
+    "sequencestatus": {"DRAFT", "ACTIVE", "PAUSED", "ARCHIVED"},
+    "enrollmentstatus": {"ACTIVE", "PAUSED", "COMPLETED", "BOUNCED", "UNSUBSCRIBED"},
+    "enrollmentstepstatus": {
+        "PENDING",
+        "SCHEDULED",
+        "SENT",
+        "SKIPPED",
+        "BOUNCED",
+        "FAILED",
+    },
+    "signaltype": {"REPLY", "OPEN", "CLICK", "BOUNCE", "UNSUBSCRIBE", "OUT_OF_OFFICE"},
+    "suppression_reason": {
+        "UNSUBSCRIBE",
+        "BOUNCE",
+        "COMPLAINT",
+        "MANUAL",
+        "API_BOUNCE",
+        "API_COMPLAINT",
+        "API_UNSUBSCRIBE",
+    },
+    "reply_intent": {
+        "positive_interest",
+        "positive_meeting",
+        "negative_not_interested",
+        "negative_wrong_person",
+        "out_of_office",
+        "autoresponder",
+        "unsubscribe_request",
+        "unknown",
+    },
+}
+
+
+async def _assert_schema_matches_orm(conn) -> None:
+    """Assert the migration-derived schema matches the ORM metadata.
+
+    Catches: missing/extra columns, wrong types, wrong nullability, missing/
+    extra enum values. Does NOT compare constraint names (naming convention
+    differences between create_all and migrations are expected).
+    """
+    import src.models.models  # noqa: F401 — register all models
+    from sqlalchemy import Enum as SAEnum
+
+    for table_name, table_obj in Base.metadata.tables.items():
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT column_name, data_type, udt_name, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = :t "
+                    "ORDER BY ordinal_position"
+                ),
+                {"t": table_name},
+            )
+        ).fetchall()
+        db_cols = {r[0]: r for r in rows}
+        orm_cols = {c.name: c for c in table_obj.columns}
+        assert set(db_cols) == set(orm_cols), (
+            f"drift: table {table_name} column mismatch — "
+            f"DB has {set(db_cols)}, ORM has {set(orm_cols)}, "
+            f"missing_in_db={set(orm_cols) - set(db_cols)}, "
+            f"missing_in_orm={set(db_cols) - set(orm_cols)}"
+        )
+        for col_name, col_obj in orm_cols.items():
+            db_col_name, db_data_type, db_udt_name, db_is_nullable = db_cols[col_name]
+            if isinstance(col_obj.type, SAEnum):
+                assert db_data_type == "USER-DEFINED", (
+                    f"drift: {table_name}.{col_name} expected enum (USER-DEFINED), "
+                    f"got {db_data_type}"
+                )
+                assert db_udt_name == col_obj.type.name, (
+                    f"drift: {table_name}.{col_name} enum type name mismatch — "
+                    f"DB has {db_udt_name!r}, ORM has {col_obj.type.name!r}"
+                )
+            else:
+                type_key = type(col_obj.type).__name__.upper()
+                expected_pg = _ORM_TYPE_TO_PG.get(type_key)
+                if expected_pg:
+                    assert db_data_type in expected_pg, (
+                        f"drift: {table_name}.{col_name} type mismatch — "
+                        f"DB has {db_data_type!r}, expected one of {expected_pg} "
+                        f"(ORM type {type_key})"
+                    )
+            expected_nullable = "YES" if col_obj.nullable else "NO"
+            assert db_is_nullable == expected_nullable, (
+                f"drift: {table_name}.{col_name} nullability mismatch — "
+                f"DB has {db_is_nullable!r}, ORM has {expected_nullable!r}"
+            )
+
+    for enum_name, expected_vals in _EXPECTED_ENUM_VALUES.items():
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT e.enumlabel FROM pg_enum e "
+                    "JOIN pg_type t ON e.enumtypid = t.oid "
+                    "WHERE t.typname = :n ORDER BY e.enumsortorder"
+                ),
+                {"n": enum_name},
+            )
+        ).fetchall()
+        db_vals = {r[0] for r in rows}
+        assert db_vals == expected_vals, (
+            f"drift: enum {enum_name} values mismatch — "
+            f"DB has {db_vals}, expected {expected_vals}, "
+            f"missing={expected_vals - db_vals}, extra={db_vals - expected_vals}"
+        )
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -372,78 +488,33 @@ async def _pg_db_url():
 
 @pytest_asyncio.fixture
 async def pg_engine(_pg_db_url):
-    """Fresh PG engine per test. Schema mirrors the production path: the app's
-    lifespan hook runs Base.metadata.create_all on startup, so the fixture does
-    the same — THEN applies ALL migrations 001-007 in order so the
-    migration-applied schema matches what a real PostgreSQL deploy gets.
+    """Fresh PG engine per test. Schema is PURELY migration-derived (r5):
+    applies migrations 000..007 on a fresh DB with NO create_all.
 
-    SV2-044 r4 (FAIL 3): the r3 fixture applied ONLY migration 006 standalone
-    — that masked drift between the ORM and the other migrations (e.g. 007's
-    reply_intent enum values diverging from the ORM's emission). The r3
-    ORM ``Enum(ReplyIntent, name="reply_intent", create_type=False)`` emitted
-    the enum MEMBER NAMES (uppercase) by default, NOT the ``.value``
-    (lowercase docs/10 strings), so an ORM insert of a Signal with a
-    reply_intent raised ``InvalidTextRepresentationError: invalid input
-    value for enum reply_intent: "UNKNOWN"`` against the migration-applied
-    schema. r4:
-      - The ORM column now uses ``values_callable`` so SQLAlchemy emits
-        ``.value`` (matching migration 007's lowercase labels).
-      - The fixture applies ALL migrations 001-007 (not just 006) so any
-        drift between the ORM and ANY migration surfaces on the very next
-        ORM insert — not just the one migration a standalone test exercises.
-      - The ``reply_intent`` enum is pre-created (like ``suppression_reason``)
-        so ``create_all`` can create the ``signals`` table with the
-        ``reply_intent`` column referencing the type. Migration 007's
-        ``CREATE TYPE`` then re-creates it (the fixture drops the
-        pre-created type + column first so the migration owns them, same
-        pattern as 006 for ``idempotency_records``).
+    SV2-044 r5 (FAIL 2): the r4 fixture ran Base.metadata.create_all then
+    dropped+re-applied only the SV2-044 tables. That hybrid masked
+    migration/ORM drift in other tables (transport, delivered_at,
+    external_ref, enum values) because create_all created the ORM version
+    and the migrations' ADD COLUMN IF NOT EXISTS was a no-op. r5 adds a
+    baseline migration 000_baseline.sql that creates the pre-migration base
+    schema, so the full chain 000->007 reproduces the COMPLETE schema with
+    NO create_all. A drift assertion (_assert_schema_matches_orm) compares
+    the final schema to the ORM metadata so any future ORM/migration
+    divergence fails loudly.
 
     The DB is session-scoped (one disposable DB per pytest session) but the
     schema is fully reset per test via DROP SCHEMA CASCADE so every test starts
-    from a clean slate — no cross-test contamination of idempotency records,
-    enrollments, or constraint state.
+    from a clean slate — no cross-test contamination.
     """
     eng = create_async_engine(_pg_db_url, echo=False)
     async with eng.begin() as conn:
-        # Full schema reset — drops all tables, types, and indexes from the
-        # public schema so every test starts clean. The session-scoped DB is
-        # reused (avoiding CREATE/DROP DATABASE per test) but the schema is
-        # disposable. CASCADE drops dependent objects (e.g. the suppression_reason
-        # enum that the suppressions table depends on).
         await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         await conn.execute(text("CREATE SCHEMA public"))
-        # Pre-create the suppression_reason enum (create_type=False in the model).
-        await conn.execute(text(_PG_CREATE_SUPPRESSION_REASON_ENUM))
-        # r4: pre-create the reply_intent enum (create_type=False in the model —
-        # migration 007 owns it). All 8 docs/10 lowercase values, matching
-        # migration 007's CREATE TYPE. create_all can then create the signals
-        # table with the reply_intent column referencing this type.
-        await conn.execute(text(_PG_CREATE_REPLY_INTENT_ENUM))
-        # Create all tables per the ORM — this is what the app's lifespan does
-        # in production (src/api/main.py lifespan -> Base.metadata.create_all).
-        # The other enum types (mailboxstatus, sequencestatus, etc.) are created
-        # automatically since they use create_type=True by default.
-        await conn.run_sync(Base.metadata.create_all)
-        # r4: drop the create_all versions of migration-owned objects so the
-        # migrations are the schema-of-record (production deploy applies the
-        # migrations, not create_all). The fixture then re-applies ALL
-        # migrations 001-007 in order. If a migration and the ORM drift, the
-        # migration wins (production deploy applies the migration, not
-        # create_all), so the fixture must run against the migration schema
-        # to catch the drift — not mask it with create_all.
-        await conn.execute(text("DROP TABLE IF EXISTS idempotency_records"))
-        # Drop the create_all reply_intent column + type so migration 007's
-        # CREATE TYPE + ADD COLUMN re-create them (proves the migration owns
-        # the type + column, not create_all).
-        await conn.execute(text("ALTER TABLE signals DROP COLUMN IF EXISTS reply_intent"))
-        await conn.execute(text("DROP TYPE IF EXISTS reply_intent"))
-        # r4: apply ALL migrations 001-007 in order. The smarter
-        # _split_sql_statements handles $$ DO blocks in 001-005 (the r3
-        # naive split-on-; broke on these).
         for mig_name in _MIGRATIONS_IN_ORDER:
             mig_path = _MIGRATIONS_DIR / mig_name
             for stmt in _split_sql_statements(mig_path.read_text()):
                 await conn.execute(text(stmt))
+        await _assert_schema_matches_orm(conn)
     yield eng
     await eng.dispose()
 

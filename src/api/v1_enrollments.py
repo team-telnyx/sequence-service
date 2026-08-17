@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -250,7 +250,9 @@ async def create_versioned_enrollment(
             id=str(uuid.uuid4()),
             enrollment_id=enrollment.id,
             step_id=step_id_by_number[s.step_number],
-            status=EnrollmentStepStatus.SCHEDULED if i == 0 else EnrollmentStepStatus.PENDING,
+            status=EnrollmentStepStatus.SCHEDULED
+            if i == 0
+            else EnrollmentStepStatus.PENDING,
             custom_subject=s.subject,
             custom_body=s.body,
         )
@@ -283,21 +285,27 @@ async def create_versioned_enrollment(
     )
 
 
-# SV2-044 r4 (FAIL 2): GET-lookup endpoint for timeout reconciliation.
-# The v2 enrollment client GETs this BEFORE any retry-POST — a read, not a
-# POST. If the lookup shows an existing enrollment (200), the client returns
-# it (no POST). If 404 (no prior attempt landed), the client retries the
-# POST. The r3 client re-POSTed on timeout (labelled a "lookup" but actually
-# a second POST) — LOOKUP_BEFORE_RETRY=False. r4 is the real reconciliation.
-@router.get("/enrollments/by-idempotency-key/{key}")
+# SV2-044 r5 (FAIL 1): GET-lookup endpoint for timeout reconciliation.
+# The idempotency key is ``scout-v2/enrollment/<uuid>`` — it CONTAINS SLASHES.
+# The r4 route declared a single-segment ``{key}`` path param, so FastAPI
+# returned 404 for every real key (the slashes split it into multiple
+# segments that didn't match the single-segment pattern). The client treated
+# the 404 as "absent" and re-POSTed → duplicate risk. r5 moves the key to a
+# QUERY PARAMETER (``?idempotency_key=<key>``) — query values carry slashes
+# safely (the client encodes, FastAPI decodes). Return 200 + existing
+# enrollment, or 404 if absent.
+@router.get("/enrollments/by-idempotency-key")
 async def lookup_enrollment_by_idempotency_key(
-    key: str,
+    idempotency_key: str = Query(..., min_length=1, max_length=500),
     db: AsyncSession = Depends(get_db),
 ):
-    """Lookup an enrollment by idempotency key (SV2-044 r4, FAIL 2).
+    """Lookup an enrollment by idempotency key (SV2-044 r5, FAIL 1).
 
     A READ endpoint for timeout reconciliation: the v2 client GETs this
-    BEFORE retrying a POST (``LOOKUP_BEFORE_RETRY=True``).
+    BEFORE retrying a POST (``LOOKUP_BEFORE_RETRY=True``). The key is passed
+    as a query parameter (not a path segment) because the key format
+    ``scout-v2/enrollment/<uuid>`` contains slashes that break single-segment
+    path routing.
 
     Returns:
       - 200 with ``EnrollmentResponse(status=EXISTING, enrollment_id,
@@ -313,7 +321,7 @@ async def lookup_enrollment_by_idempotency_key(
     record_q = await db.execute(
         select(IdempotencyRecord).where(
             IdempotencyRecord.scope == IDEMPOTENCY_SCOPE,
-            IdempotencyRecord.idempotency_key == key,
+            IdempotencyRecord.idempotency_key == idempotency_key,
         )
     )
     rec = record_q.scalar_one_or_none()
@@ -322,7 +330,7 @@ async def lookup_enrollment_by_idempotency_key(
             status_code=404,
             content={
                 "contract_version": ENROLLMENT_CONTRACT_VERSION,
-                "idempotency_key": key,
+                "idempotency_key": idempotency_key,
                 "detail": "no enrollment found for this idempotency key",
             },
         )
@@ -337,7 +345,7 @@ async def lookup_enrollment_by_idempotency_key(
                 contract_version=ENROLLMENT_CONTRACT_VERSION,
                 status=EnrollmentStatusContract.EXISTING,
                 enrollment_id=None,
-                idempotency_key=key,
+                idempotency_key=idempotency_key,
                 capacity_date=None,
                 reason_code="sequence.idempotency_pending",
             ).model_dump(),
@@ -349,7 +357,7 @@ async def lookup_enrollment_by_idempotency_key(
             contract_version=ENROLLMENT_CONTRACT_VERSION,
             status=EnrollmentStatusContract.EXISTING,
             enrollment_id=result.get("enrollment_id"),
-            idempotency_key=key,
+            idempotency_key=idempotency_key,
             capacity_date=result.get("capacity_date"),
             reason_code=None,
         ).model_dump(),

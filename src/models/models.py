@@ -15,9 +15,9 @@ from sqlalchemy import (
     Integer,
     Boolean,
     Enum,
-    JSON,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.contracts import ReplyIntent
@@ -75,7 +75,9 @@ class Tenant(Base):
     # Relationships
     mailboxes: Mapped[list["Mailbox"]] = relationship(back_populates="tenant")
     sequences: Mapped[list["Sequence"]] = relationship(back_populates="tenant")
-    webhook_configs: Mapped[list["WebhookConfig"]] = relationship(back_populates="tenant")
+    webhook_configs: Mapped[list["WebhookConfig"]] = relationship(
+        back_populates="tenant"
+    )
 
 
 class Mailbox(Base):
@@ -86,7 +88,9 @@ class Mailbox(Base):
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"))
     email: Mapped[str] = mapped_column(String(255))
     display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    status: Mapped[MailboxStatus] = mapped_column(Enum(MailboxStatus), default=MailboxStatus.ACTIVE)
+    status: Mapped[MailboxStatus] = mapped_column(
+        Enum(MailboxStatus), default=MailboxStatus.ACTIVE
+    )
     weight: Mapped[int] = mapped_column(Integer, default=1)
     daily_send_limit: Mapped[int] = mapped_column(Integer, default=50)
     sent_today: Mapped[int] = mapped_column(Integer, default=0)
@@ -108,7 +112,9 @@ class Mailbox(Base):
     enrollment_steps: Mapped[list["SequenceEnrollmentStep"]] = relationship(
         back_populates="mailbox"
     )
-    enrollments: Mapped[list["SequenceEnrollment"]] = relationship(back_populates="mailbox")
+    enrollments: Mapped[list["SequenceEnrollment"]] = relationship(
+        back_populates="mailbox"
+    )
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "email", name="uq_mailbox_tenant_email"),
@@ -136,7 +142,9 @@ class Sequence(Base):
     steps: Mapped[list["SequenceStep"]] = relationship(
         back_populates="sequence", order_by="SequenceStep.step_number"
     )
-    enrollments: Mapped[list["SequenceEnrollment"]] = relationship(back_populates="sequence")
+    enrollments: Mapped[list["SequenceEnrollment"]] = relationship(
+        back_populates="sequence"
+    )
 
 
 class SequenceStep(Base):
@@ -153,7 +161,9 @@ class SequenceStep(Base):
 
     # Relationships
     sequence: Mapped["Sequence"] = relationship(back_populates="steps")
-    enrollment_steps: Mapped[list["SequenceEnrollmentStep"]] = relationship(back_populates="step")
+    enrollment_steps: Mapped[list["SequenceEnrollmentStep"]] = relationship(
+        back_populates="step"
+    )
 
     __table_args__ = (
         UniqueConstraint("sequence_id", "step_number", name="uq_sequence_step_number"),
@@ -200,15 +210,21 @@ class SequenceEnrollment(Base):
     # rows and non-Scout callers are unaffected; lets reply/bounce signals join back
     # to the originating prospect deterministically instead of email-only matching
     # (REVOPS-972 identity). DB column applied by migration 001.
-    external_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    external_ref: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
 
     # Relationships
     sequence: Mapped["Sequence"] = relationship(back_populates="enrollments")
     mailbox: Mapped["Mailbox"] = relationship(back_populates="enrollments")
-    steps: Mapped[list["SequenceEnrollmentStep"]] = relationship(back_populates="enrollment")
+    steps: Mapped[list["SequenceEnrollmentStep"]] = relationship(
+        back_populates="enrollment"
+    )
 
     __table_args__ = (
-        UniqueConstraint("sequence_id", "contact_email", name="uq_enrollment_sequence_contact"),
+        UniqueConstraint(
+            "sequence_id", "contact_email", name="uq_enrollment_sequence_contact"
+        ),
         CheckConstraint(
             "pause_reason IS NULL OR pause_reason IN "
             "('circuit_breaker', 'reply', 'unsubscribe', 'bounce', 'manual')",
@@ -224,7 +240,9 @@ class SequenceEnrollmentStep(Base):
 
     enrollment_id: Mapped[str] = mapped_column(ForeignKey("sequence_enrollments.id"))
     step_id: Mapped[str] = mapped_column(ForeignKey("sequence_steps.id"))
-    mailbox_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mailboxes.id"), nullable=True)
+    mailbox_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("mailboxes.id"), nullable=True
+    )
     status: Mapped[EnrollmentStepStatus] = mapped_column(
         Enum(EnrollmentStepStatus), default=EnrollmentStepStatus.PENDING
     )
@@ -238,8 +256,12 @@ class SequenceEnrollmentStep(Base):
     # Relationships
     enrollment: Mapped["SequenceEnrollment"] = relationship(back_populates="steps")
     step: Mapped["SequenceStep"] = relationship(back_populates="enrollment_steps")
-    mailbox: Mapped[Optional["Mailbox"]] = relationship(back_populates="enrollment_steps")
-    sent_emails: Mapped[list["SentEmail"]] = relationship(back_populates="enrollment_step")
+    mailbox: Mapped[Optional["Mailbox"]] = relationship(
+        back_populates="enrollment_steps"
+    )
+    sent_emails: Mapped[list["SentEmail"]] = relationship(
+        back_populates="enrollment_step"
+    )
 
 
 class SentEmail(Base):
@@ -250,7 +272,9 @@ class SentEmail(Base):
     message_id: Mapped[str] = mapped_column(String(255), unique=True)
     thread_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     mailbox_id: Mapped[str] = mapped_column(ForeignKey("mailboxes.id"))
-    enrollment_step_id: Mapped[str] = mapped_column(ForeignKey("sequence_enrollment_steps.id"))
+    enrollment_step_id: Mapped[str] = mapped_column(
+        ForeignKey("sequence_enrollment_steps.id")
+    )
     subject: Mapped[str] = mapped_column(String(500))
     body: Mapped[str] = mapped_column(Text)
     to_email: Mapped[str] = mapped_column(String(255))
@@ -262,7 +286,9 @@ class SentEmail(Base):
 
     # Relationships
     mailbox: Mapped["Mailbox"] = relationship(back_populates="sent_emails")
-    enrollment_step: Mapped["SequenceEnrollmentStep"] = relationship(back_populates="sent_emails")
+    enrollment_step: Mapped["SequenceEnrollmentStep"] = relationship(
+        back_populates="sent_emails"
+    )
     signals: Mapped[list["Signal"]] = relationship(back_populates="sent_email")
 
 
@@ -336,7 +362,9 @@ class Suppression(Base):
 
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"))
     email: Mapped[str] = mapped_column(String(255), index=True)
-    domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    domain: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
     reason: Mapped[SuppressionReason] = mapped_column(
         Enum(SuppressionReason, name="suppression_reason", create_type=False)
     )
@@ -348,7 +376,9 @@ class Suppression(Base):
     # Relationships
     tenant: Mapped["Tenant"] = relationship()
 
-    __table_args__ = (UniqueConstraint("tenant_id", "email", name="uq_suppression_tenant_email"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "email", name="uq_suppression_tenant_email"),
+    )
 
 
 class WebhookConfig(Base):
@@ -429,5 +459,5 @@ class IdempotencyRecord(Base):
     idempotency_key: Mapped[str] = mapped_column(String(500), primary_key=True)
     request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False)
-    result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    result: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)

@@ -323,19 +323,36 @@ def _split_sql_statements(sql_text: str) -> list[str]:
 
 # SV2-044 r5 (FAIL 2): drift assertion — compares the migration-derived schema
 # to the ORM metadata so any future ORM/migration divergence fails loudly.
-# Compares column names, PG types, nullability, and enum value sets. Does NOT
-# compare constraint/index names (they differ between create_all naming
-# convention and migration explicit names) — only semantic structure.
+# Compares column names, PG types, nullability, VARCHAR lengths, DateTime
+# tz-awareness, and enum value sets. Does NOT compare constraint/index names
+# (they differ between create_all naming convention and migration explicit
+# names) — only semantic structure.
+#
+# SV2-044 r6 (FAIL 2): the r5 checker was LENIENT — it mapped ORM class names
+# ``VARCHAR``/``TIMESTAMP`` but the actual SQLAlchemy class names are
+# ``String``/``DateTime`` (uppercased to ``STRING``/``DATETIME``), so the
+# lookup returned None and the entire String/DateTime branch was SKIPPED. It
+# also accepted both ``json`` and ``jsonb`` for ``JSON`` columns. That
+# leniency masked 6 real migration/ORM mismatches (TEXT vs VARCHAR(n), JSON
+# vs JSONB). r6 makes the checker STRICT:
+#   - ``String(n)`` → assert DB is ``character varying(n)`` with the SAME
+#     length n (None for unbounded). Fails on ``text`` or any length mismatch.
+#   - ``DateTime`` → assert DB is ``timestamp without time zone`` (naive) or
+#     ``timestamp with time zone`` (tz-aware), matching ``col.type.timezone``.
+#     No skip.
+#   - ``JSON`` → ``json`` ONLY; ``JSONB`` → ``jsonb`` ONLY. No cross-accept.
+#   - Unknown ORM types FAIL (no silent skip — a new type must be added to
+#     the map explicitly so it can never drift unnoticed).
 
-# ORM type → expected PG data_type (information_schema.columns.data_type).
-# Enum columns show as 'USER-DEFINED' with udt_name = the enum type name.
+# ORM type class name (uppercased) → expected PG information_schema.data_type.
+# The key is type(col_obj.type).__name__.upper() — e.g. ``String`` → ``STRING``.
 _ORM_TYPE_TO_PG = {
-    "VARCHAR": {"character varying"},
-    "TEXT": {"text"},
-    "INTEGER": {"integer"},
-    "BOOLEAN": {"boolean"},
-    "JSON": {"json", "jsonb"},
-    "TIMESTAMP": {"timestamp without time zone"},
+    "STRING": "character varying",
+    "TEXT": "text",
+    "INTEGER": "integer",
+    "BOOLEAN": "boolean",
+    "JSON": "json",
+    "JSONB": "jsonb",
 }
 
 # Enum type name → expected values (after migrations 000..007 applied).
@@ -381,18 +398,27 @@ _EXPECTED_ENUM_VALUES = {
 async def _assert_schema_matches_orm(conn) -> None:
     """Assert the migration-derived schema matches the ORM metadata.
 
-    Catches: missing/extra columns, wrong types, wrong nullability, missing/
-    extra enum values. Does NOT compare constraint names (naming convention
-    differences between create_all and migrations are expected).
+    Catches: missing/extra columns, wrong types, wrong VARCHAR lengths, wrong
+    DateTime tz-awareness, wrong nullability, missing/extra enum values, and
+    unknown ORM types (no silent skip). Does NOT compare constraint names
+    (naming convention differences between create_all and migrations are
+    expected).
+
+    SV2-044 r6 (FAIL 2): STRICT — String(n) checks character_maximum_length,
+    DateTime checks tz-awareness, JSON/JSONB are strict (no cross-accept),
+    and unknown types FAIL instead of being silently skipped. Dispatches on
+    the exact type class name (not isinstance) because SQLAlchemy's ``Text``
+    subclasses ``String`` — isinstance would mis-route Text columns into the
+    varchar branch.
     """
     import src.models.models  # noqa: F401 — register all models
-    from sqlalchemy import Enum as SAEnum
 
     for table_name, table_obj in Base.metadata.tables.items():
         rows = (
             await conn.execute(
                 text(
-                    "SELECT column_name, data_type, udt_name, is_nullable "
+                    "SELECT column_name, data_type, udt_name, is_nullable, "
+                    "character_maximum_length "
                     "FROM information_schema.columns "
                     "WHERE table_schema = 'public' AND table_name = :t "
                     "ORDER BY ordinal_position"
@@ -409,8 +435,14 @@ async def _assert_schema_matches_orm(conn) -> None:
             f"missing_in_orm={set(db_cols) - set(orm_cols)}"
         )
         for col_name, col_obj in orm_cols.items():
-            db_col_name, db_data_type, db_udt_name, db_is_nullable = db_cols[col_name]
-            if isinstance(col_obj.type, SAEnum):
+            db_col_name, db_data_type, db_udt_name, db_is_nullable, db_char_len = (
+                db_cols[col_name]
+            )
+            # Dispatch on the EXACT type class name, not isinstance —
+            # SQLAlchemy's Text subclasses String, so isinstance would
+            # misroute Text columns into the varchar branch.
+            type_name = type(col_obj.type).__name__
+            if type_name == "Enum":
                 assert db_data_type == "USER-DEFINED", (
                     f"drift: {table_name}.{col_name} expected enum (USER-DEFINED), "
                     f"got {db_data_type}"
@@ -419,15 +451,43 @@ async def _assert_schema_matches_orm(conn) -> None:
                     f"drift: {table_name}.{col_name} enum type name mismatch — "
                     f"DB has {db_udt_name!r}, ORM has {col_obj.type.name!r}"
                 )
+            elif type_name == "DateTime":
+                if col_obj.type.timezone:
+                    expected_dt = "timestamp with time zone"
+                else:
+                    expected_dt = "timestamp without time zone"
+                assert db_data_type == expected_dt, (
+                    f"drift: {table_name}.{col_name} DateTime tz mismatch — "
+                    f"DB has {db_data_type!r}, expected {expected_dt!r} "
+                    f"(ORM timezone={col_obj.type.timezone})"
+                )
+            elif type_name == "String":
+                assert db_data_type == "character varying", (
+                    f"drift: {table_name}.{col_name} type mismatch — "
+                    f"DB has {db_data_type!r}, expected 'character varying' "
+                    f"(ORM String, length={col_obj.type.length})"
+                )
+                orm_length = col_obj.type.length
+                assert orm_length == db_char_len, (
+                    f"drift: {table_name}.{col_name} VARCHAR length mismatch — "
+                    f"DB has character_maximum_length={db_char_len}, "
+                    f"ORM has length={orm_length}"
+                )
             else:
-                type_key = type(col_obj.type).__name__.upper()
+                type_key = type_name.upper()
                 expected_pg = _ORM_TYPE_TO_PG.get(type_key)
-                if expected_pg:
-                    assert db_data_type in expected_pg, (
-                        f"drift: {table_name}.{col_name} type mismatch — "
-                        f"DB has {db_data_type!r}, expected one of {expected_pg} "
-                        f"(ORM type {type_key})"
-                    )
+                assert expected_pg is not None, (
+                    f"drift: {table_name}.{col_name} has unmapped ORM type "
+                    f"{type_key!r} ({type(col_obj.type).__module__}."
+                    f"{type(col_obj.type).__name__}) — add it to _ORM_TYPE_TO_PG "
+                    f"or handle it explicitly above; the checker must not "
+                    f"silently skip any type"
+                )
+                assert db_data_type == expected_pg, (
+                    f"drift: {table_name}.{col_name} type mismatch — "
+                    f"DB has {db_data_type!r}, expected {expected_pg!r} "
+                    f"(ORM type {type_key})"
+                )
             expected_nullable = "YES" if col_obj.nullable else "NO"
             assert db_is_nullable == expected_nullable, (
                 f"drift: {table_name}.{col_name} nullability mismatch — "

@@ -23,9 +23,15 @@ Cursor semantics:
   - On empty/missing cursor, start from the first page (ProcessedEmailEvent
     dedupe markers make the backfill safe — re-pulled events are no-ops).
   - The cursor advances ONLY after every event on a page is processed
-    successfully. A failed page leaves the cursor untouched so the next run
-    re-fetches and retries (already-processed events no-op via the marker).
-  - A short page (< page_size) ends the run.
+    successfully AND the page returns a non-null ``page_cursor``. A failed
+    page leaves the cursor untouched so the next run re-fetches and retries
+    (already-processed events no-op via the marker).
+  - A short page (< page_size) ends the run. The API returns NO
+    ``page_cursor`` on the final short page — the persisted cursor stays at
+    the last non-null value (the cursor that pointed AT the tail page), so
+    the next run re-fetches only the tail page (small overlap; dedupe absorbs
+    it). Pre-fix the poller persisted None on every tail page → every
+    subsequent cycle re-walked the entire history (REVOPS-1525 follow-up).
 
 Failure behavior:
   - API unreachable/401/5xx → log warning, leave cursor untouched, return.
@@ -234,9 +240,10 @@ async def poll_once(
                 return summary
             _tally(summary, result)
 
-        cursor = next_cursor
-        await save_cursor(session_factory, feed, cursor)
-        summary.cursor_advanced = True
+        if next_cursor:
+            cursor = next_cursor
+            await save_cursor(session_factory, feed, cursor)
+            summary.cursor_advanced = True
 
         if len(items) < page_size:
             return summary

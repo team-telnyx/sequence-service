@@ -350,7 +350,10 @@ class TestPollOnceHappyPaths:
 
         assert summary.processed == 1
         assert summary.errors == 0
-        assert summary.cursor_advanced is True
+        # Tail page (1 item < page_size 25) with no page_cursor → no non-null
+        # cursor saved → cursor_advanced False (REVOPS-1525 follow-up: pre-fix
+        # this was True because the poller persisted None unconditionally).
+        assert summary.cursor_advanced is False
 
         async with session_factory() as s:
             supps = (await s.execute(select(Suppression))).scalars().all()
@@ -870,8 +873,10 @@ class TestPollOnceCursorContract:
         assert summary.pages == 2, f"expected 2 pages, got {summary.pages}"
         assert summary.processed == 1
         assert summary.cursor_advanced is True
-        # Cursor ends at the last short page's next_cursor (None).
-        assert await load_cursor(session_factory) is None
+        # Cursor stays at the last non-null cursor ("c2" from page 1) — the
+        # tail page returned no page_cursor, so it must NOT null the persisted
+        # cursor (REVOPS-1525 follow-up: pre-fix this was None → full rewalk).
+        assert await load_cursor(session_factory) == "c2"
 
 
 # ── poll_once — unhandled event types are skipped ────────────────────────────
@@ -901,10 +906,173 @@ class TestPollOnceSkipsUnhandledTypes:
         assert summary.skipped == 3, f"expected 3 skipped, got {summary}"
         assert summary.processed == 0
         assert summary.errors == 0
-        assert summary.cursor_advanced is True, (
-            "skipped (unhandled) events must NOT block the cursor"
+        # Tail page (3 items < page_size 25) with no page_cursor → no non-null
+        # cursor saved → cursor_advanced False. Skipped events still do NOT
+        # block the cursor (they process successfully); the cursor simply has
+        # nothing to advance TO on a tail page (REVOPS-1525 follow-up: pre-fix
+        # this was True because the poller persisted None unconditionally).
+        assert summary.cursor_advanced is False, (
+            "skipped (unhandled) events must NOT block the cursor; no "
+            "page_cursor on the tail page means nothing to advance to"
         )
         async with session_factory() as s:
             assert (
                 len((await s.execute(select(ProcessedEmailEvent))).scalars().all()) == 0
             )
+
+
+# ── poll_once — tail-page None cursor fix (REVOPS-1525 follow-up) ────────────
+
+
+class TestPollOnceTailCursorNoneFix:
+    """REVOPS-1525 follow-up: the API returns NO ``page_cursor`` on the final
+    short page. Pre-fix the poller did ``cursor = next_cursor; await
+    save_cursor(cursor)`` unconditionally → it persisted ``None`` on every tail
+    page → the next cycle restarted from page 1 and re-walked the entire
+    history (dedupe made it correct but unbounded API-load growth as event
+    history grows). Fix: only assign + persist when ``next_cursor`` is truthy;
+    ``cursor_advanced`` is True only when a non-null cursor was saved.
+
+    Live evidence (2026-08-17): first cycle walked 11 pages and finished
+    ``cursor_advanced=True``, but ``email_events_poller_cursor.last_cursor``
+    was EMPTY — every subsequent 2-minute cycle restarted from page 1.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tail_page_with_items_no_page_cursor_keeps_prior_cursor(
+        self, session_factory, seeded
+    ):
+        """Two-page stream: page 1 full with ``next_cursor="c1"``, page 2 short
+        WITH items but ``page_cursor`` absent. Pre-fix the poller overwrote
+        the cursor with None → next run re-walked from page 1. Post-fix the
+        persisted cursor stays at ``"c1"`` (the cursor that pointed AT the tail
+        page), so the next run re-fetches ONLY the tail page (small overlap;
+        dedupe absorbs it)."""
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-tail-1",
+            contact_email="tail1@acme.com",
+            enrollment_id="enr-tail-1",
+            step_id="estep-tail-1",
+        )
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-tail-2",
+            contact_email="tail2@acme.com",
+            enrollment_id="enr-tail-2",
+            step_id="estep-tail-2",
+        )
+        # Page 1: full (page_size=1, 1 item) → next_cursor="c1"
+        # Page 2: short (1 item < page_size=25, items present, NO page_cursor)
+        page1 = _page(
+            [
+                _api_item(
+                    event_type="email.delivered",
+                    event_id="evt-tail-1",
+                    message_id="msg-tail-1",
+                    to_email="tail1@acme.com",
+                )
+            ],
+            page_size=1,
+            next_cursor="c1",
+        )
+        page2 = _page(
+            [
+                _api_item(
+                    event_type="email.delivered",
+                    event_id="evt-tail-2",
+                    message_id="msg-tail-2",
+                    to_email="tail2@acme.com",
+                )
+            ],
+            # default page_size=25 → 1 item is short; default next_cursor=None
+        )
+        pages = {None: page1, "c1": page2}
+        client = httpx.AsyncClient(transport=_transport(pages))
+
+        summary = await poll_once(session_factory, client, BASE_URL, API_KEY)
+        await client.aclose()
+
+        assert summary.processed == 2, f"both events must process, got {summary}"
+        assert summary.errors == 0
+        assert summary.cursor_advanced is True, (
+            "page 1 saved a non-null cursor → advanced"
+        )
+        # The persisted cursor is "c1" (page 1's next_cursor), NOT None — the
+        # tail page's missing page_cursor must NOT overwrite it. Pre-fix this
+        # was None → every subsequent cycle re-walked from page 1.
+        assert await load_cursor(session_factory) == "c1", (
+            "tail page with no page_cursor must NOT null the persisted cursor"
+        )
+
+        # Second run: must resume from "c1" (NOT page 1) — re-fetches only the
+        # tail page. Markers make the re-pull a no-op.
+        captured_cursors = []
+
+        def handler(request):
+            cursor = request.url.params.get("page[cursor]")
+            captured_cursors.append(cursor)
+            if cursor == "c1":
+                # Same tail page (re-pulled) — markers absorb the overlap.
+                return httpx.Response(200, json=page2)
+            return httpx.Response(200, json=_page([]))
+
+        client2 = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        summary2 = await poll_once(session_factory, client2, BASE_URL, API_KEY)
+        await client2.aclose()
+
+        assert captured_cursors[0] == "c1", (
+            "second run must resume from the persisted tail cursor, not page 1"
+        )
+        assert summary2.already_processed == 1, (
+            f"re-pulled tail event must no-op via marker, got {summary2}"
+        )
+        assert summary2.processed == 0
+        assert summary2.errors == 0
+        # Tail page again returns no page_cursor → cursor stays at "c1".
+        assert await load_cursor(session_factory) == "c1"
+
+    @pytest.mark.asyncio
+    async def test_single_short_first_page_no_cursor_no_prior_stays_none(
+        self, session_factory, seeded
+    ):
+        """Single short first page with items but NO ``page_cursor`` and NO
+        prior cursor → nothing to save, persisted cursor stays None, no crash,
+        ``cursor_advanced`` False (no non-null cursor was saved). Pre-fix this
+        saved None and set cursor_advanced=True."""
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-tail-none",
+            contact_email="tailnone@acme.com",
+            enrollment_id="enr-tail-none",
+            step_id="estep-tail-none",
+        )
+
+        # Single short page (1 item < page_size=25), default next_cursor=None.
+        page = _page(
+            [
+                _api_item(
+                    event_type="email.delivered",
+                    event_id="evt-tail-none",
+                    message_id="msg-tail-none",
+                    to_email="tailnone@acme.com",
+                )
+            ]
+        )
+        client = httpx.AsyncClient(transport=_transport({None: page}))
+
+        summary = await poll_once(session_factory, client, BASE_URL, API_KEY)
+        await client.aclose()
+
+        assert summary.processed == 1, f"event must process, got {summary}"
+        assert summary.errors == 0
+        assert summary.cursor_advanced is False, (
+            "no non-null cursor was saved → cursor_advanced must be False"
+        )
+        # Nothing was saved — persisted cursor stays None (no crash, no row).
+        assert await load_cursor(session_factory) is None, (
+            "no prior cursor + tail page with no page_cursor → nothing saved"
+        )

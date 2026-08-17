@@ -168,9 +168,7 @@ async def test_duplicate_enqueue_for_same_step_and_scheduled_at_dedupes(monkeypa
     # continue` — to avoid counting a deduped enqueue as a fresh
     # reconciliation). A regression to returning the id would silently
     # over-count `reconciled` (finding 2).
-    assert r2 is None, (
-        f"deduped enqueue must return None (reconciler None contract); got {r2!r}"
-    )
+    assert r2 is None, f"deduped enqueue must return None (reconciler None contract); got {r2!r}"
 
 
 # ── Re-schedule: same step_id + DIFFERENT scheduled_at → NEW job ────────────
@@ -207,8 +205,7 @@ async def test_reschedule_same_step_with_different_scheduled_at_makes_new_job(
     )
     assert len(captured_ids) == 2
     assert captured_ids[0] != captured_ids[1], (
-        "re-schedule with different scheduled_at must produce a NEW _job_id; "
-        f"got {captured_ids}"
+        f"re-schedule with different scheduled_at must produce a NEW _job_id; got {captured_ids}"
     )
 
 
@@ -246,6 +243,10 @@ async def test_create_enrollment_handles_deduped_enqueue_return(
             yield s
 
     monkeypatch.setattr("src.api.main.async_session", session_factory)
+    # Auth is env-var-based now — patch settings so the middleware accepts the test key.
+    import src.api.main as main_mod
+
+    monkeypatch.setattr(main_mod.settings, "sequence_service_api_key", seeded["api_key"])
     app.dependency_overrides[get_db] = _override_get_db
     try:
         transport = ASGITransport(app=app)
@@ -269,9 +270,7 @@ async def test_create_enrollment_handles_deduped_enqueue_return(
 
 
 @pytest.mark.asyncio
-async def test_queue_next_step_handles_deduped_enqueue_return(
-    seeded, session_factory, monkeypatch
-):
+async def test_queue_next_step_handles_deduped_enqueue_return(seeded, session_factory, monkeypatch):
     """sequence_step._queue_next_step captures `job_id = await queue_sequence_step(...)`
     at line ~532. With dedup working, that can return None. The function must
     not AttributeError on None.
@@ -335,9 +334,7 @@ async def test_queue_next_step_handles_deduped_enqueue_return(
 
 
 @pytest.mark.asyncio
-async def test_reconciler_sweep_double_enqueue_dedupes(
-    seeded, session_factory, monkeypatch
-):
+async def test_reconciler_sweep_double_enqueue_dedupes(seeded, session_factory, monkeypatch):
     """Two consecutive reconciler sweeps re-enqueueing the SAME step with the
     SAME `scheduled_at` must produce ONE job, not two — proving the dedup
     mechanism collapses the live flood (reconciler + circuit_resume + retry
@@ -427,8 +424,7 @@ async def test_reconciler_sweep_double_enqueue_dedupes(
     )
     # Only ONE distinct _job_id passed to the fake pool.
     assert len(seen_job_ids) == 1, (
-        f"dedup must collapse second enqueue — expected 1 distinct _job_id, "
-        f"got {seen_job_ids}"
+        f"dedup must collapse second enqueue — expected 1 distinct _job_id, got {seen_job_ids}"
     )
 
 
@@ -459,12 +455,9 @@ async def test_job_id_format_explicit_invariant(monkeypatch):
         tenant_id="t",
         scheduled_at=sched,
     )
-    expected = (
-        f"step:estep-invariant:{int(sched.replace(tzinfo=timezone.utc).timestamp())}"
-    )
+    expected = f"step:estep-invariant:{int(sched.replace(tzinfo=timezone.utc).timestamp())}"
     assert captured["job_id"] == expected, (
-        f"explicit format invariant violated: expected {expected!r}, "
-        f"got {captured['job_id']!r}"
+        f"explicit format invariant violated: expected {expected!r}, got {captured['job_id']!r}"
     )
 
 
@@ -611,9 +604,7 @@ async def test_capacity_defer_produces_identical_job_id_across_microsecond_skew(
 
 
 @pytest.mark.asyncio
-async def test_capacity_defer_stores_naive_scheduled_at(
-    seeded, session_factory, monkeypatch
-):
+async def test_capacity_defer_stores_naive_scheduled_at(seeded, session_factory, monkeypatch):
     """After a capacity-defer, the step's `scheduled_at` must be naive
     (tzinfo is None) — guards against the aware-datetime-into-naive-column
     trap this repo has been bitten by three times today.
@@ -729,8 +720,7 @@ async def test_dedup_key_is_tz_invariant(monkeypatch):
         f"got {key_chicago!r} expected {expected!r}"
     )
     assert key_utc == expected, (
-        f"key under UTC must match UTC-normalized expected; "
-        f"got {key_utc!r} expected {expected!r}"
+        f"key under UTC must match UTC-normalized expected; got {key_utc!r} expected {expected!r}"
     )
     assert key_chicago == key_utc, (
         "dedup key must be TZ-invariant — same naive scheduled_at under "
@@ -832,9 +822,7 @@ async def test_reconciler_enqueue_failure_leaves_scheduled_at_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_reconciler_return_dict_contains_advanced(
-    seeded, session_factory, monkeypatch
-):
+async def test_reconciler_return_dict_contains_advanced(seeded, session_factory, monkeypatch):
     """The reconciler's returned dict must contain `advanced` alongside
     `reconciled`, `skipped_at_capacity`, etc.
     """
@@ -888,9 +876,7 @@ async def test_reconciler_return_dict_contains_advanced(
     assert "advanced" in out, (
         f"returned dict must contain 'advanced' (finding 5); keys={list(out.keys())}"
     )
-    assert out["advanced"] == 1, (
-        f"one step reconciled → advanced must be 1; got {out['advanced']}"
-    )
+    assert out["advanced"] == 1, f"one step reconciled → advanced must be 1; got {out['advanced']}"
     assert out["reconciled"] == 1, (
         f"one step reconciled → reconciled must be 1; got {out['reconciled']}"
     )

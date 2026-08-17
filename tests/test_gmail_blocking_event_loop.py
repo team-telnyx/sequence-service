@@ -150,9 +150,7 @@ def _enable_gmail(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_detect_signals_does_not_block_event_loop(
-    seeded, session_factory, monkeypatch
-):
+async def test_detect_signals_does_not_block_event_loop(seeded, session_factory, monkeypatch):
     """Given a blocking get_replies_to_threads, a concurrently-scheduled
     coroutine must still make progress while detect_signals is running.
 
@@ -283,9 +281,7 @@ async def test_process_sequence_step_send_does_not_block_event_loop(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_same_mailbox_runs_are_serialized(
-    seeded, session_factory, monkeypatch
-):
+async def test_concurrent_same_mailbox_runs_are_serialized(seeded, session_factory, monkeypatch):
     """Two detect_signals runs on the SAME mailbox launched concurrently must
     not interleave their get_replies_to_threads calls — the per-mailbox lock
     must serialize them so they cannot corrupt the shared httplib2 state.
@@ -328,9 +324,7 @@ async def test_concurrent_same_mailbox_runs_are_serialized(
     # Reconstruct regions from the timeline.
     enters = [t for tag, t in timeline if tag == "enter"]
     exits = [t for tag, t in timeline if tag == "exit"]
-    assert len(enters) == 2 and len(exits) == 2, (
-        "both runs must have entered get_replies"
-    )
+    assert len(enters) == 2 and len(exits) == 2, "both runs must have entered get_replies"
 
     # Two non-overlapping regions: one's exit is <= the other's enter.
     regions = sorted(zip(enters, exits))
@@ -395,18 +389,12 @@ async def test_second_run_fetches_fewer_threads(seeded, session_factory, monkeyp
         c.start()
     try:
         with patch.object(sd, "create_signal_webhook", new=_async_false):
-            r1 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
+            r1 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
             first_threads_fetched = len(call_log["threads_fetched"])
             # Snapshot the call log length so the delta isolates run 2's fetches.
             fetch_count_before_run2 = len(call_log["threads_fetched"])
-            r2 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
-            second_threads_fetched = (
-                len(call_log["threads_fetched"]) - fetch_count_before_run2
-            )
+            r2 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
+            second_threads_fetched = len(call_log["threads_fetched"]) - fetch_count_before_run2
     finally:
         for c in cms:
             c.stop()
@@ -462,9 +450,7 @@ async def test_send_passes_through_identical_args(seeded, session_factory, monke
     step_id = "estep-args"
 
     inbox = MagicMock()
-    inbox.send_html_email = MagicMock(
-        return_value={"message_id": "m-args", "thread_id": "t-args"}
-    )
+    inbox.send_html_email = MagicMock(return_value={"message_id": "m-args", "thread_id": "t-args"})
 
     monkeypatch.setattr(ss.settings, "gmail_enabled", True, raising=False)
     cms = [
@@ -492,7 +478,7 @@ async def test_send_passes_through_identical_args(seeded, session_factory, monke
     assert kwargs["plain_text_fallback"]  # non-empty plain fallback
     assert "bcc" in kwargs  # may be the SFDC address or None
     assert "list_unsubscribe" in kwargs
-    assert "one_click" in kwargs
+    assert "one_click" not in kwargs  # SV2-044: deleted — no first-party one-click endpoint
     assert "sender_name" in kwargs
 
 
@@ -629,17 +615,13 @@ async def test_ooo_then_reply_thread_still_polled_and_pauses_enrollment(
         c.start()
     try:
         with patch.object(sd, "create_signal_webhook", new=_async_false):
-            r1 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
+            r1 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
 
             # Read enrollment state BETWEEN runs to prove OOO did NOT pause.
             async with session_factory() as s:
                 enr_after_ooo = (
                     await s.execute(
-                        select(SequenceEnrollment).where(
-                            SequenceEnrollment.id == "enr-ooo"
-                        )
+                        select(SequenceEnrollment).where(SequenceEnrollment.id == "enr-ooo")
                     )
                 ).scalar_one()
                 assert enr_after_ooo.status == EnrollmentStatus.ACTIVE, (
@@ -647,9 +629,7 @@ async def test_ooo_then_reply_thread_still_polled_and_pauses_enrollment(
                     f"{enr_after_ooo.status.value}"
                 )
 
-            r2 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
+            r2 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
     finally:
         for c in cms:
             c.stop()
@@ -674,9 +654,7 @@ async def test_ooo_then_reply_thread_still_polled_and_pauses_enrollment(
 
     async with session_factory() as s:
         enr = (
-            await s.execute(
-                select(SequenceEnrollment).where(SequenceEnrollment.id == "enr-ooo")
-            )
+            await s.execute(select(SequenceEnrollment).where(SequenceEnrollment.id == "enr-ooo"))
         ).scalar_one()
         assert enr.status == EnrollmentStatus.PAUSED, (
             "the genuine REPLY on run 2 must have paused the enrollment, "
@@ -686,9 +664,7 @@ async def test_ooo_then_reply_thread_still_polled_and_pauses_enrollment(
 
 
 @pytest.mark.asyncio
-async def test_reply_signal_still_skips_thread_on_next_run(
-    seeded, session_factory, monkeypatch
-):
+async def test_reply_signal_still_skips_thread_on_next_run(seeded, session_factory, monkeypatch):
     """A thread with a recorded REPLY IS skipped on the next run — the
     intended optimization is preserved. REPLY is terminal (enrollment
     pauses), so re-fetching would only re-discover the same reply.
@@ -721,12 +697,8 @@ async def test_reply_signal_still_skips_thread_on_next_run(
         c.start()
     try:
         with patch.object(sd, "create_signal_webhook", new=_async_false):
-            r1 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
-            r2 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
+            r1 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
+            r2 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
     finally:
         for c in cms:
             c.stop()
@@ -740,9 +712,7 @@ async def test_reply_signal_still_skips_thread_on_next_run(
 
 
 @pytest.mark.asyncio
-async def test_bounce_signal_still_skips_thread_on_next_run(
-    seeded, session_factory, monkeypatch
-):
+async def test_bounce_signal_still_skips_thread_on_next_run(seeded, session_factory, monkeypatch):
     """A thread with a recorded BOUNCE IS skipped on the next run — the
     intended optimization is preserved. BOUNCE is terminal (enrollment
     bounces), so re-fetching would only re-discover the same bounce.
@@ -775,12 +745,8 @@ async def test_bounce_signal_still_skips_thread_on_next_run(
         c.start()
     try:
         with patch.object(sd, "create_signal_webhook", new=_async_false):
-            r1 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
-            r2 = await sd.detect_signals(
-                {}, seeded["active_mailbox_id"], seeded["tenant_id"]
-            )
+            r1 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
+            r2 = await sd.detect_signals({}, seeded["active_mailbox_id"], seeded["tenant_id"])
     finally:
         for c in cms:
             c.stop()

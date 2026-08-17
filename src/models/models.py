@@ -4,6 +4,7 @@ Mirrors the Prisma schema from the TypeScript version.
 """
 
 import enum
+import uuid
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
@@ -14,10 +15,13 @@ from sqlalchemy import (
     Integer,
     Boolean,
     Enum,
+    JSON,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from src.contracts import ReplyIntent
 from src.models.base import Base
 
 
@@ -296,6 +300,37 @@ class Signal(Base):
 
     sent_email_id: Mapped[str] = mapped_column(ForeignKey("sent_emails.id"))
     type: Mapped[SignalType] = mapped_column(Enum(SignalType))
+    # SV2-044 r3: versioned reply-intent classification (contracts.ReplyIntent).
+    # Set ONLY for signal types that carry a reply intent — REPLY (UNKNOWN
+    # pending deeper content analysis, out of scope for this packet) and
+    # OUT_OF_OFFICE (OUT_OF_OFFICE). NULL for BOUNCE (bounce is NOT a
+    # ReplyIntent — it is structurally detected and handled as a separate
+    # SignalType) and for non-reply signals (OPEN/CLICK/UNSUBSCRIBE).
+    #
+    # SV2-044 r4 (FAIL 3): ``values_callable`` makes SQLAlchemy emit the
+    # enum ``.value`` (lowercase docs/10 strings: "positive_interest", etc.)
+    # for BOTH the column type's allowed labels AND the bind parameters —
+    # matching migration 007's ``CREATE TYPE reply_intent AS ENUM (...)``
+    # values. The r3 column used ``Enum(ReplyIntent, name="reply_intent",
+    # create_type=False)`` WITHOUT ``values_callable`` → SQLAlchemy emits
+    # the enum MEMBER NAMES (uppercase: "POSITIVE_INTEREST", etc.) by
+    # default, NOT the ``.value`` → an ORM insert raised
+    # ``InvalidTextRepresentationError: invalid input value for enum
+    # reply_intent: "UNKNOWN"`` because the DB type's labels (lowercase)
+    # didn't match the bound values (uppercase). r4 aligns them ONE
+    # canonical way (the docs/10 lowercase values) via ``values_callable``
+    # so the DB enum labels, the SQLAlchemy emission, and
+    # ``ReplyIntent.value`` are all identical. Bounce stays OUT of the
+    # enum (structurally classified, reply_intent=None).
+    reply_intent: Mapped[Optional[ReplyIntent]] = mapped_column(
+        Enum(
+            ReplyIntent,
+            values_callable=lambda e: [m.value for m in e],
+            name="reply_intent",
+            create_type=False,
+        ),
+        nullable=True,
+    )
     detected_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     raw_data: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -398,3 +433,36 @@ class ProcessedEmailEvent(Base):
 
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     processed_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+
+
+# ReplyIntent is re-exported from src.contracts (the canonical contract
+# module) for back-compat with callers that imported it from models. SV2-044
+# r3: the canonical definition lives in contracts.py so the contract-compat
+# test can bite on a divergent server enum. SV2-044 r4: REPLY_INTENT_CONTRACT_VERSION
+# is NO LONGER re-exported from models — import it from src.contracts directly
+# (nothing in this repo imports it from models; the re-export was unused).
+__all_re_exports__ = ["ReplyIntent"]
+
+
+class IdempotencyRecord(Base):
+    """Idempotency record for versioned contract operations (docs/10 §idempotency_records).
+
+    PK (scope, idempotency_key). Reuse of a key with a different request digest
+    is a conflict, never prior success. A timeout is reconciled by
+    idempotency-key lookup before retry.
+    """
+
+    __tablename__ = "idempotency_records"
+
+    # Override Base.id — this table uses a composite PK, not the inherited id PK.
+    id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid.uuid4()))
+    scope: Mapped[str] = mapped_column(String(100), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(500), primary_key=True)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False)
+    # JSONB on PostgreSQL (matches migration 006 + drift checker); JSON on SQLite
+    # so Base.metadata.create_all() renders in the existing SQLite test fixtures.
+    result: Mapped[Optional[dict]] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), nullable=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)

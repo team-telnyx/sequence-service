@@ -79,9 +79,14 @@ logger = structlog.get_logger()
 
 DEDUPE_RETENTION_DAYS = 30
 
+# Full Telnyx Email API delivery event set (SV2-044).
+EVENT_SENT = "sent"
 EVENT_DELIVERED = "delivered"
 EVENT_BOUNCE = "bounce"
+EVENT_OPENED = "opened"
+EVENT_CLICKED = "clicked"
 EVENT_COMPLAINT = "complaint"
+EVENT_SUPPRESSED = "suppressed"
 EVENT_UNSUBSCRIBE = "unsubscribe"
 
 _REASON_MAP: dict[str, SuppressionReason] = {
@@ -93,13 +98,17 @@ _REASON_MAP: dict[str, SuppressionReason] = {
 
 @dataclass(frozen=True)
 class EmailEvent:
-    """Normalized Telnyx Email API webhook event (transport-agnostic)."""
+    """Normalized Telnyx Email API webhook event (transport-agnostic).
+
+    contract_version: the delivery-event contract version (SV2-044).
+    """
 
     event_id: str
     event_type: str
     message_id: str
     to_email: str
     occurred_at: Optional[str] = None
+    contract_version: int = 1
 
 
 async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
@@ -207,6 +216,38 @@ async def process_email_event(db: AsyncSession, event: EmailEvent) -> dict:
         sent_email.delivered_at = datetime.utcnow()
         logger.info(
             "Email delivered (Telnyx Email API)",
+            event_id=event.event_id,
+            message_id=event.message_id,
+            to_email=contact_email,
+        )
+    elif event.event_type == EVENT_SENT:
+        logger.info(
+            "Email sent confirmed (Telnyx Email API)",
+            event_id=event.event_id,
+            message_id=event.message_id,
+            to_email=contact_email,
+        )
+    elif event.event_type in (EVENT_OPENED, EVENT_CLICKED):
+        logger.info(
+            "Email engagement event (Telnyx Email API)",
+            event_id=event.event_id,
+            event_type=event.event_type,
+            message_id=event.message_id,
+            to_email=contact_email,
+        )
+    elif event.event_type == EVENT_SUPPRESSED:
+        await _write_suppression(
+            db,
+            tenant_id=tenant_id,
+            email=contact_email,
+            domain=None,
+            reason=SuppressionReason.API_BOUNCE,
+            enrollment_id=enrollment.id,
+            event=event,
+        )
+        enrollment.status = EnrollmentStatus.BOUNCED
+        logger.info(
+            "Email suppressed by Telnyx (Email API)",
             event_id=event.event_id,
             message_id=event.message_id,
             to_email=contact_email,
@@ -451,6 +492,4 @@ def _build_idempotent_insert(
 async def _prune_dedupe(db: AsyncSession) -> None:
     """Delete dedupe markers older than DEDUPE_RETENTION_DAYS."""
     cutoff = datetime.utcnow() - timedelta(days=DEDUPE_RETENTION_DAYS)
-    await db.execute(
-        delete(ProcessedEmailEvent).where(ProcessedEmailEvent.processed_at < cutoff)
-    )
+    await db.execute(delete(ProcessedEmailEvent).where(ProcessedEmailEvent.processed_at < cutoff))

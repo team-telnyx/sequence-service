@@ -261,6 +261,16 @@ class EmailAPITransport:
         one_click: bool = False,
         in_reply_to_message_id: Optional[str] = None,
         sandbox_mode: bool = False,
+        # SV2-044 r3 (FAIL 1c): STABLE Idempotency-Key from the send identity.
+        # The caller (sequence_step.py) derives this DETERMINISTICALLY from
+        # the logical send identity (e.g. ``seq-send:{enrollment_step_id}``)
+        # so a timeout→retry sends the SAME key → the Email API dedupes the
+        # second request server-side. The r1 adapter generated a FRESH uuid4
+        # per attempt, so a retry sent a DIFFERENT key → duplicate delivery.
+        # None = omit the header (back-compat with tests that don't pass one;
+        # production MUST pass a stable key — the sequence_step.py call site
+        # is the enforcement point).
+        idempotency_key: Optional[str] = None,
         _client: Optional[httpx.AsyncClient] = None,
     ) -> dict:
         """Send an HTML email via the Telnyx Email API.
@@ -275,6 +285,12 @@ class EmailAPITransport:
         deliver it — the response status is ``"sandbox"`` (per the
         EmailMessageStatus enum). Used by the gated live smoke test so there
         is no scheduled residue to cancel.
+
+        ``idempotency_key`` is the STABLE Telnyx Idempotency-Key header value
+        (SV2-044 r3). The caller MUST derive it deterministically from the
+        logical send identity (e.g. ``seq-send:{enrollment_step_id}``) so a
+        timeout→retry reuses the same key. None omits the header (back-compat
+        with tests; production passes a stable key).
 
         ``_client`` is for tests only (inject an httpx.AsyncClient with a
         MockTransport); production leaves it None and a short-lived client is
@@ -307,6 +323,12 @@ class EmailAPITransport:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        # r3 (FAIL 1c): STABLE Idempotency-Key on every send. The Telnyx
+        # Email API dedupes on this header — a retry with the same key does
+        # not produce a duplicate send. The caller MUST derive the key
+        # deterministically from the logical send identity (not uuid4()).
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
 
         own_client = _client is None
         client = _client or httpx.AsyncClient(timeout=self.timeout)
@@ -333,11 +355,7 @@ class EmailAPITransport:
                 # message_id=None or status=None as a success would silently
                 # lose the send (the caller writes a pending- message_id and
                 # never learns the real Telnyx UUID).
-                if (
-                    not isinstance(data, dict)
-                    or not data.get("id")
-                    or not data.get("status")
-                ):
+                if not isinstance(data, dict) or not data.get("id") or not data.get("status"):
                     raise EmailAPIRetryableError(
                         f"Email API returned 202 but the response body is "
                         f"malformed — data.id and data.status are required "
@@ -374,8 +392,7 @@ class EmailAPITransport:
                     except ValueError:
                         retry_after = None
                 raise EmailAPIReputationError(
-                    f"Email API 429 — sending suspended (reputation band "
-                    f"'poor'): {resp.text}",
+                    f"Email API 429 — sending suspended (reputation band 'poor'): {resp.text}",
                     status_code=429,
                     retryable=True,
                     retry_after=retry_after,

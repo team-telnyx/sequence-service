@@ -21,7 +21,6 @@ from src.models.models import (
     EnrollmentStatus,
 )
 from src.services.email_builder import build_tracked_email
-from src.api.tracking import generate_unsubscribe_url
 from src.services.gmail import GmailService, GmailError
 from src.services.email_api import EmailAPITransport, EmailAPIError
 from src.services.mailbox_rotation import (
@@ -75,6 +74,20 @@ def _is_html_body(body: str) -> bool:
     the char after ``<`` is a digit, not one of these tag names.
     """
     return bool(re.search(r"<(p|br|div|a|html)[ >/]", body, re.IGNORECASE))
+
+
+class _AmbiguousRetryableError(Exception):
+    """A sentinel retryable error for the ambiguous-marker skip path. The
+    marker exists from a prior ambiguous send (pending- message_id); we do
+    NOT re-send (at-most-once). We raise ArqRetry with this sentinel so
+    _compute_retry_defer computes a backoff and arq counts the attempt
+    toward max_tries. The error message is informational only (it never
+    reaches the user — it's caught by arq's retry machinery).
+    """
+
+    @property
+    def retry_after(self) -> None:
+        return None
 
 
 def _compute_retry_defer(exc, ctx: dict) -> float:
@@ -222,9 +235,7 @@ async def process_sequence_step(
         enrollment_step = result.scalar_one_or_none()
 
         if not enrollment_step:
-            logger.error(
-                "Enrollment step not found", enrollment_step_id=enrollment_step_id
-            )
+            logger.error("Enrollment step not found", enrollment_step_id=enrollment_step_id)
             raise ValueError(f"Enrollment step not found: {enrollment_step_id}")
 
         enrollment = enrollment_step.enrollment
@@ -310,33 +321,68 @@ async def process_sequence_step(
         # to a prospect is worse than a rare missed follow-up. A *known* GmailError
         # removes its marker (see below), so only a hard crash mid-send leaves one.
         existing_send = await db.execute(
-            select(SentEmail.id)
-            .where(SentEmail.enrollment_step_id == enrollment_step.id)
-            .limit(1)
+            select(SentEmail).where(SentEmail.enrollment_step_id == enrollment_step.id).limit(1)
         )
-        if existing_send.scalar_one_or_none() is not None:
-            logger.warning(
-                "Idempotency: send already attempted for step — skipping re-send",
-                enrollment_step_id=enrollment_step_id,
-            )
-            if enrollment_step.status != EnrollmentStepStatus.SENT:
-                enrollment_step.status = EnrollmentStepStatus.SENT
+        sent_email_existing = existing_send.scalar_one_or_none()
+        if sent_email_existing is not None:
+            msg_id = sent_email_existing.message_id or ""
+            if not msg_id.startswith("pending-"):
+                logger.info(
+                    "Idempotency: send already completed for step — skipping re-send",
+                    enrollment_step_id=enrollment_step_id,
+                    message_id=msg_id,
+                )
+                if enrollment_step.status != EnrollmentStepStatus.SENT:
+                    enrollment_step.status = EnrollmentStepStatus.SENT
+                    await db.commit()
+                return {"skipped": True, "reason": "already_sent"}
+            job_try = int(ctx.get("job_try", 1))
+            max_tries = settings.worker_max_tries
+            if job_try >= max_tries:
+                enrollment_step.status = EnrollmentStepStatus.FAILED
+                try:
+                    await release_send(db, sent_email_existing.mailbox_id)
+                except Exception as rel_err:
+                    logger.warning(
+                        "Failed to release send slot on ambiguous-exhaustion",
+                        error=str(rel_err),
+                    )
                 await db.commit()
-            return {"skipped": True, "reason": "already_sent"}
+                logger.error(
+                    "Ambiguous send exhausted max_tries — terminal failure (row -> FAILED)",
+                    job_try=job_try,
+                    max_tries=max_tries,
+                    enrollment_step_id=enrollment_step_id,
+                    mailbox_id=sent_email_existing.mailbox_id,
+                )
+                return {
+                    "failed": True,
+                    "reason": "max_retries_exhausted",
+                    "error": "ambiguous send (pending marker kept); exhausted retries without re-send",
+                    "job_try": job_try,
+                    "max_tries": max_tries,
+                }
+            logger.info(
+                "Idempotency: ambiguous send marker present — skipping re-send, counting attempt",
+                enrollment_step_id=enrollment_step_id,
+                job_try=job_try,
+                max_tries=max_tries,
+            )
+            raise ArqRetry(
+                defer=_compute_retry_defer(
+                    _AmbiguousRetryableError("ambiguous send marker present"), ctx
+                )
+            )
 
         # Use enrollment's sticky mailbox (assigned at enrollment time)
         from src.models.models import Mailbox
         from src.config import validate_mailbox_for_tenant
 
-        result = await db.execute(
-            select(Mailbox).where(Mailbox.id == enrollment.mailbox_id)
-        )
+        result = await db.execute(select(Mailbox).where(Mailbox.id == enrollment.mailbox_id))
         mailbox = result.scalar_one_or_none()
 
         if not mailbox:
-            logger.error(
-                "Enrollment mailbox not found", mailbox_id=enrollment.mailbox_id
-            )
+            logger.error("Enrollment mailbox not found", mailbox_id=enrollment.mailbox_id)
             raise RuntimeError(f"Enrollment mailbox not found: {enrollment.mailbox_id}")
 
         # HARDCODED ENFORCEMENT: Verify mailbox is allowed for this tenant
@@ -385,9 +431,7 @@ async def process_sequence_step(
             # Scout composed this email - use it directly
             subject = enrollment_step.custom_subject
             body = enrollment_step.custom_body
-            logger.info(
-                "Using Scout-composed content", enrollment_step_id=enrollment_step_id
-            )
+            logger.info("Using Scout-composed content", enrollment_step_id=enrollment_step_id)
         else:
             # Fall back to step template
             subject, body = render_email(
@@ -410,9 +454,7 @@ async def process_sequence_step(
                 enrollment_step_id=enrollment_step_id,
                 enrollment_id=enrollment.id,
                 to_email=enrollment.contact_email,
-                has_custom=bool(
-                    enrollment_step.custom_subject and enrollment_step.custom_body
-                ),
+                has_custom=bool(enrollment_step.custom_subject and enrollment_step.custom_body),
             )
             enrollment_step.status = EnrollmentStepStatus.SKIPPED
             await db.commit()
@@ -455,18 +497,11 @@ async def process_sequence_step(
             enrollment_id=enrollment.id,
         )
 
-        # Build RFC 8058 List-Unsubscribe header. Advertise the one-click HTTPS
-        # endpoint ONLY when it's reachable (one_click_unsubscribe_enabled);
-        # otherwise mailto-only, so we never advertise a dead one-click URL
-        # (track.telnyx.com is NXDOMAIN — Wave 0 interim).
-        mailto_unsub = "<mailto:unsubscribe@telnyx.com?subject=unsubscribe>"
-        if settings.one_click_unsubscribe_enabled:
-            unsub_url = generate_unsubscribe_url(
-                settings.tracking_base_url, enrollment.id
-            )
-            list_unsubscribe = f"<{unsub_url}>, {mailto_unsub}"
-        else:
-            list_unsubscribe = mailto_unsub
+        # Build RFC 8058 List-Unsubscribe header. mailto: only — no first-party
+        # HTTPS endpoint (the /track/unsubscribe base64 endpoint was deleted in
+        # SV2-044). One-click unsubscribe is handled by the Email API webhook
+        # (email.unsubscribed events) when the Email API is the transport.
+        list_unsubscribe = "<mailto:unsubscribe@telnyx.com?subject=unsubscribe>"
 
         # REVOPS-1552: per-mailbox transport selection. The Mailbox.transport
         # column ('gmail' default | 'email_api') drives the send path. P1-B:
@@ -475,6 +510,18 @@ async def process_sequence_step(
         # DB CHECK constrains SQL writes, but ORM writes, SQLite tests, and
         # future values can bypass it, so the dispatch fails safe.
         if mailbox.transport == "email_api":
+            # SV2-044 r3 (FAIL 1c): STABLE Idempotency-Key derived from the
+            # logical send identity. The r1 adapter generated a FRESH uuid4
+            # per attempt → a timeout→retry sent a DIFFERENT key → duplicate
+            # delivery. The key is deterministic from enrollment_step_id (the
+            # durable send marker's identity) so a retry reuses the same key
+            # → the Email API dedupes the second request server-side. The
+            # SentEmail row (committed below BEFORE the send) is the durable
+            # marker the pre-check at the top of process_sequence_step
+            # reconciles by — a retry that reaches this point sees the marker
+            # and skips the re-send. The Idempotency-Key header is
+            # defense-in-depth at the API layer.
+            send_idempotency_key = f"seq-send:{enrollment_step.id}"
             try:
                 transport = EmailAPITransport.get_instance()
                 result = await transport.send_html_email(
@@ -485,8 +532,8 @@ async def process_sequence_step(
                     plain_text_fallback=plain_body,
                     sender_name=mailbox.display_name,
                     list_unsubscribe=list_unsubscribe,
-                    one_click=settings.one_click_unsubscribe_enabled,
                     bcc=settings.salesforce_bcc_address or None,
+                    idempotency_key=send_idempotency_key,
                 )
                 api_message_id = result["message_id"]
 
@@ -498,23 +545,61 @@ async def process_sequence_step(
                     from_email=mailbox.email,
                     to_email=enrollment.contact_email,
                     message_id=api_message_id,
+                    idempotency_key=send_idempotency_key,
                 )
             except EmailAPIError as e:
                 logger.error("Email API send failed", error=str(e))
-                # F3 (at-most-once) + F5 (capacity release): same cleanup for
-                # both terminal and retryable — the marker is removed so the
-                # step is retryable (by arq Retry or by reconcile), and the
-                # capacity slot is returned so a failed attempt doesn't
-                # permanently throttle the mailbox.
-                try:
-                    await db.delete(sent_email)
-                    await db.commit()
-                except Exception as del_err:
-                    logger.warning("Failed to remove send marker", error=str(del_err))
-                try:
-                    await release_send(db, mailbox.id)
-                except Exception as rel_err:
-                    logger.warning("Failed to release send slot", error=str(rel_err))
+                # SV2-044 r3 (FAIL 1c): on an AMBIGUOUS timeout (retryable
+                # error), the email may have been delivered — we do NOT know.
+                # The r1 path DELETED the durable send marker (SentEmail row)
+                # then retried → the next arq attempt didn't see the marker,
+                # reserved capacity AGAIN, and sent AGAIN → duplicate
+                # delivery after an ambiguous timeout. The r3 fix:
+                #   - retryable (timeout/5xx/429/malformed-202): KEEP the
+                #     marker. The next arq attempt's pre-check (the
+                #     existing_send block at the top of this function)
+                #     sees the marker and SKIPS the re-send (returns
+                #     already_sent). Capacity stays reserved from the
+                #     original attempt — if the send actually delivered,
+                #     capacity is correctly consumed; if not, we lose one
+                #     slot until daily reset (the safer trade-off vs a
+                #     duplicate send to a prospect). The Idempotency-Key
+                #     header is defense-in-depth at the API layer.
+                #   - permanent 4xx: DELETE the marker (definitive
+                #     non-delivery — the API rejected the request). The
+                #     step is terminalized to FAILED below; no re-send.
+                is_retryable = e.retryable
+                if not is_retryable:
+                    # Permanent 4xx — definitive non-delivery. Delete the
+                    # marker so the step is retryable by a manual operator
+                    # action (not arq retry — arq retries are for
+                    # retryable errors only). Capacity is released.
+                    try:
+                        await db.delete(sent_email)
+                        await db.commit()
+                    except Exception as del_err:
+                        logger.warning("Failed to remove send marker", error=str(del_err))
+                    try:
+                        await release_send(db, mailbox.id)
+                    except Exception as rel_err:
+                        logger.warning("Failed to release send slot", error=str(rel_err))
+                else:
+                    # Retryable (ambiguous timeout/5xx/429/malformed-202):
+                    # KEEP the marker. The next arq attempt reconciles by
+                    # the durable marker (the existing_send pre-check
+                    # skips the re-send). Capacity stays reserved — see
+                    # the comment above for the trade-off rationale.
+                    logger.warning(
+                        "Email API retryable error — keeping send marker "
+                        "(at-most-once; next arq attempt reconciles by marker)",
+                        error=str(e),
+                        enrollment_step_id=enrollment_step_id,
+                        idempotency_key=send_idempotency_key,
+                    )
+                    # Do NOT release capacity on ambiguous timeout — the
+                    # original attempt may have consumed the slot. Releasing
+                    # would let a re-send consume a SECOND slot for the same
+                    # logical send, defeating the daily cap.
                 # P1-A: retryable adapter errors (429/5xx/timeout) must raise
                 # arq.worker.Retry so ARQ actually re-enqueues with backoff.
                 # The adapter sets e.retryable=True for those and False for
@@ -548,6 +633,24 @@ async def process_sequence_step(
                     if job_try >= max_tries:
                         enrollment_step.status = EnrollmentStepStatus.FAILED
                         await db.commit()
+                        # r3 (FAIL 1c): on the terminal-FAILED path, RELEASE
+                        # the capacity slot (no more retries — releasing is
+                        # safe under at-most-once; a re-send is impossible
+                        # because the row is FAILED and the reconciler won't
+                        # resurrect it). The marker is KEPT (not deleted) —
+                        # if the row is ever resurrected by a future code
+                        # path, the marker prevents a re-send (at-most-once
+                        # defense). The marker staying in the DB is harmless
+                        # (the pre-check only runs at the top of
+                        # process_sequence_step, which won't be called again
+                        # for a FAILED row).
+                        try:
+                            await release_send(db, mailbox.id)
+                        except Exception as rel_err:
+                            logger.warning(
+                                "Failed to release send slot on terminal failure",
+                                error=str(rel_err),
+                            )
                         logger.error(
                             "Email API retryable error exhausted max_tries "
                             "— terminal failure (row -> FAILED)",
@@ -574,9 +677,7 @@ async def process_sequence_step(
                     # cap in _compute_retry_defer bounds the advance so a
                     # genuinely lost job is still detected within
                     # cap + grace.
-                    enrollment_step.scheduled_at = datetime.utcnow() + timedelta(
-                        seconds=defer_s
-                    )
+                    enrollment_step.scheduled_at = datetime.utcnow() + timedelta(seconds=defer_s)
                     await db.commit()
                     logger.info(
                         "Email API retryable error — deferring arq retry",
@@ -630,7 +731,6 @@ async def process_sequence_step(
                         plain_text_fallback=plain_body,
                         sender_name=mailbox.display_name,
                         list_unsubscribe=list_unsubscribe,
-                        one_click=settings.one_click_unsubscribe_enabled,
                         bcc=settings.salesforce_bcc_address or None,
                     )
                     gmail_message_id = result["message_id"]
@@ -651,15 +751,11 @@ async def process_sequence_step(
                         await db.delete(sent_email)
                         await db.commit()
                     except Exception as del_err:
-                        logger.warning(
-                            "Failed to remove send marker", error=str(del_err)
-                        )
+                        logger.warning("Failed to remove send marker", error=str(del_err))
                     try:
                         await release_send(db, mailbox.id)
                     except Exception as rel_err:
-                        logger.warning(
-                            "Failed to release send slot", error=str(rel_err)
-                        )
+                        logger.warning("Failed to release send slot", error=str(rel_err))
                     raise RuntimeError(f"Gmail send failed: {e}")
             else:
                 # Stub mode - generate fake message ID
@@ -827,9 +923,7 @@ async def _queue_next_step(
     # (absolute time), not the raw step delay, so the job fires at the right
     # moment even when a prior step ran late (past-due guard pushed
     # scheduled_at forward to now + min_gap).
-    delay_seconds = int(
-        max(0, (next_enrollment_step.scheduled_at - now).total_seconds())
-    )
+    delay_seconds = int(max(0, (next_enrollment_step.scheduled_at - now).total_seconds()))
     try:
         job_id = await queue_sequence_step(
             enrollment_step_id=next_enrollment_step.id,

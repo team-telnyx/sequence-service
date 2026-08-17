@@ -76,15 +76,20 @@ async def _run() -> None:
             summary = await poll_once(
                 session_factory, client, base_url, api_key, feed=POLLER_FEED
             )
+            # stdlib logger — %-format args, NOT structlog-style kwargs
+            # (review round 1: structlog kwargs on a stdlib logger raised
+            # TypeError → exit 1 on a routine 401).
             logger.info(
-                "Email events poll complete",
-                pages=summary.pages,
-                processed=summary.processed,
-                already_processed=summary.already_processed,
-                unmatched=summary.unmatched,
-                skipped=summary.skipped,
-                errors=summary.errors,
-                cursor_advanced=summary.cursor_advanced,
+                "Email events poll complete pages=%d processed=%d "
+                "already_processed=%d unmatched=%d skipped=%d errors=%d "
+                "cursor_advanced=%s",
+                summary.pages,
+                summary.processed,
+                summary.already_processed,
+                summary.unmatched,
+                summary.skipped,
+                summary.errors,
+                summary.cursor_advanced,
             )
     finally:
         await engine.dispose()
@@ -94,10 +99,12 @@ def main() -> None:
     try:
         lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
     except OSError as e:
+        # Fail closed (review round 1): the previous branch fell through to
+        # _run() WITHOUT the lock, allowing overlapping instances. If the
+        # lock file cannot be opened, log and exit 0 without polling.
         logger.warning(
-            "Could not open poller lock file — running without lock", error=str(e)
+            "Could not open poller lock file — exiting without polling: %s", e
         )
-        asyncio.run(_run())
         return
 
     try:
@@ -110,10 +117,10 @@ def main() -> None:
     try:
         asyncio.run(_run())
     except Exception as e:
-        logger.error(
-            "Poller run failed — swallowing to protect host process",
-            error=str(e),
-        )
+        # stdlib logger — %-format arg, NOT structlog-style `error=` kwarg
+        # (review round 1: structlog kwarg on a stdlib logger raised
+        # TypeError → exit 1 on a routine failure that escaped _run()).
+        logger.error("Poller run failed — swallowing to protect host process: %s", e)
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

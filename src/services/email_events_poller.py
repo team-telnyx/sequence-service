@@ -56,13 +56,13 @@ EVENTS_PATH = "/email/events"
 POLLER_FEED = "email_events"
 DEFAULT_PAGE_SIZE = 25
 
-# Internal event types the poller OWNS. queued/sending/sent are owned by the
-# send path (the poller must not double-count send-state); opened/clicked are
-# engagement events out of scope. Items outside this set are skipped
-# client-side (the API's filter[event_type] is broken — verified 2026-08-17).
-_HANDLED_INTERNAL_TYPES = frozenset(
-    {"delivered", "bounce", "complaint", "unsubscribe", "suppressed"}
-)
+# Internal event types the poller OWNS: bounce/complaint/unsubscribe/
+# delivered ONLY. queued/sending/sent are owned by the send path (the poller
+# must not double-count send-state); opened/clicked are engagement events
+# out of scope; suppressed is the receiver's job (the poller must not
+# double-suppress). Items outside this set are skipped client-side (the
+# API's filter[event_type] is broken — verified 2026-08-17).
+_HANDLED_INTERNAL_TYPES = frozenset({"delivered", "bounce", "complaint", "unsubscribe"})
 
 
 class PollerAPIError(Exception):
@@ -194,38 +194,45 @@ async def poll_once(
         next_cursor = meta.get("page_cursor")
         summary.pages += 1
 
-        errored = False
         for item in items:
             try:
                 event = extract_event_from_api_item(item)
             except (KeyError, TypeError, ValueError) as e:
+                # Malformed HANDLED-type item (unhandled types return None,
+                # not raise) is a page failure — STOP, cursor untouched, warn.
+                # Skipping it would advance the cursor past an unprocessed
+                # event, permanently losing it. The next run re-fetches this
+                # page; the failed event retries.
                 logger.warning(
-                    "Malformed event item — skipping",
+                    "Malformed handled-type event item — page fails, cursor unchanged",
                     error=str(e),
                     item_id=item.get("id"),
                 )
-                summary.skipped += 1
-                continue
+                summary.errors += 1
+                return summary
             if event is None:
+                # Unhandled type (queued/sending/sent/opened/clicked/suppressed)
+                # — skippable; does not block the cursor.
                 summary.skipped += 1
                 continue
             try:
                 async with session_factory() as db:
                     result = await process_email_event(db, event)
             except Exception as e:
+                # STOP at the first processing failure — events after the
+                # failure stay unprocessed; cursor untouched so the next
+                # run re-fetches this page (already-processed events no-op
+                # via the marker, the failed event retries, subsequent
+                # events process).
                 logger.warning(
-                    "Event processing failed — cursor will not advance past this page",
+                    "Event processing failed — page fails, cursor unchanged",
                     error=str(e),
                     event_id=event.event_id,
                     event_type=event.event_type,
                 )
                 summary.errors += 1
-                errored = True
-                continue
+                return summary
             _tally(summary, result)
-
-        if errored:
-            return summary
 
         cursor = next_cursor
         await save_cursor(session_factory, feed, cursor)

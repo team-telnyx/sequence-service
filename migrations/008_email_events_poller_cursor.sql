@@ -18,8 +18,16 @@
 --
 -- The ORM (src/models/models.py EmailEventsPollerCursor) mirrors this table
 -- so create_all test DBs and the live schema agree. Idempotent: IF NOT EXISTS
--- means re-running is a no-op. Style matches 005 (ADD COLUMN/TABLE IF NOT
+-- means re-running is a no-op. Style matches 005/006 (ADD COLUMN/TABLE IF NOT
 -- EXISTS, GUARD, one transaction).
+--
+-- Timestamp idiom (review round 1): created_at/updated_at are
+-- TIMESTAMP WITHOUT TIME ZONE NOT NULL with a server-side DEFAULT
+-- (now() AT TIME ZONE 'UTC') — matches migration 006. The DEFAULT emits
+-- naive-UTC (not session-local wall time) so a non-UTC host TZ cannot skew
+-- the column; the ORM also sets datetime.utcnow() on the Python side, and
+-- raw-SQL inserts (e.g. a backfill) get the correct UTC default. NOT NULL
+-- matches the ORM (Mapped[datetime] inherited from Base, non-nullable).
 
 BEGIN;
 
@@ -37,8 +45,8 @@ END $$;
 CREATE TABLE IF NOT EXISTS email_events_poller_cursor (
   id VARCHAR PRIMARY KEY,
   last_cursor VARCHAR(2000),
-  created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+  created_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+  updated_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC')
 );
 
 COMMIT;

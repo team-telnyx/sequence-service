@@ -239,6 +239,16 @@ class TestExtractEvent:
         for raw in ("email.opened", "email.clicked"):
             assert extract_event_from_api_item(_api_item(event_type=raw)) is None
 
+    def test_skips_suppressed(self):
+        """Review round 1: ``suppressed`` is the receiver's job (the poller
+        must not double-suppress) — removed from ``_HANDLED_INTERNAL_TYPES``.
+        Pre-fix the poller would re-process ``email.suppressed`` events and
+        double-write suppressions alongside the receiver path."""
+        assert (
+            extract_event_from_api_item(_api_item(event_type="email.suppressed"))
+            is None
+        )
+
     def test_unknown_event_type_returns_none(self):
         assert (
             extract_event_from_api_item(_api_item(event_type="email.unknown")) is None
@@ -560,6 +570,160 @@ class TestPollOnceCursorContract:
         assert summary.cursor_advanced is False
         # Cursor must be UNCHANGED — the failed event blocks advancement.
         assert await load_cursor(session_factory) == "pre-existing-cursor"
+
+    @pytest.mark.asyncio
+    async def test_mid_page_failure_stops_page_and_retries_on_next_run(
+        self, session_factory, seeded, monkeypatch
+    ):
+        """Review round 1 repro: 3-event page, event #2 raises → #1 marker
+        written, #2 AND #3 unprocessed, cursor unchanged. Next run: #1
+        no-ops (marker), #2 and #3 process. Pre-fix the loop ``continue``d
+        to #3 after #2 failed, processing #3 and masking the failure
+        boundary — the reviewer required STOP-at-first-failure so the
+        invariant "events at or after the cursor are unprocessed" holds."""
+        # 3 independent chains so the 3 events don't interact (a delivered
+        # for msg-A, a delivered for msg-B, a delivered for msg-C).
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-mid-1",
+            contact_email="mid1@acme.com",
+            enrollment_id="enr-mid-1",
+            step_id="estep-mid-1",
+        )
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-mid-2",
+            contact_email="mid2@acme.com",
+            enrollment_id="enr-mid-2",
+            step_id="estep-mid-2",
+        )
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-mid-3",
+            contact_email="mid3@acme.com",
+            enrollment_id="enr-mid-3",
+            step_id="estep-mid-3",
+        )
+
+        item1 = _api_item(
+            event_type="email.delivered",
+            event_id="evt-mid-1",
+            message_id="msg-mid-1",
+            to_email="mid1@acme.com",
+        )
+        item2 = _api_item(
+            event_type="email.delivered",
+            event_id="evt-mid-2",
+            message_id="msg-mid-2",
+            to_email="mid2@acme.com",
+        )
+        item3 = _api_item(
+            event_type="email.delivered",
+            event_id="evt-mid-3",
+            message_id="msg-mid-3",
+            to_email="mid3@acme.com",
+        )
+        page = _page([item1, item2, item3], next_cursor="next-mid")
+        client = httpx.AsyncClient(transport=_transport({None: page}))
+
+        import src.services.email_events_poller as poller_mod
+
+        original = poller_mod.process_email_event
+        bad_calls = {"n": 0}
+
+        async def flaky(db, event):
+            # Fail evt-mid-2 ONLY on the first call (run 1). On retry the
+            # bad_calls counter has advanced, so #2 processes cleanly.
+            if event.event_id == "evt-mid-2" and bad_calls["n"] == 0:
+                bad_calls["n"] += 1
+                raise RuntimeError("simulated processing failure on first run")
+            return await original(db, event)
+
+        monkeypatch.setattr(poller_mod, "process_email_event", flaky)
+
+        # Run 1: #1 processes, #2 raises → STOP, #3 unprocessed, cursor unchanged.
+        run1 = await poll_once(session_factory, client, BASE_URL, API_KEY)
+        assert run1.processed == 1, f"run1: #1 must process, got {run1}"
+        assert run1.errors == 1, f"run1: #2 must error, got {run1}"
+        assert run1.cursor_advanced is False
+        assert await load_cursor(session_factory) is None
+
+        async with session_factory() as s:
+            marker_ids = {
+                m.id
+                for m in (await s.execute(select(ProcessedEmailEvent))).scalars().all()
+            }
+        assert "evt-mid-1" in marker_ids, "#1 marker must be written on run 1"
+        assert "evt-mid-2" not in marker_ids, "#2 must be unprocessed (no marker)"
+        assert "evt-mid-3" not in marker_ids, "#3 must be unprocessed (no marker)"
+
+        # Run 2: same page (cursor unchanged). #1 no-ops, #2 retries, #3 processes.
+        run2 = await poll_once(session_factory, client, BASE_URL, API_KEY)
+        await client.aclose()
+        assert run2.already_processed == 1, f"run2: #1 no-ops, got {run2}"
+        assert run2.processed == 2, f"run2: #2 and #3 process, got {run2}"
+        assert run2.errors == 0
+        assert run2.cursor_advanced is True
+        assert await load_cursor(session_factory) == "next-mid"
+
+        async with session_factory() as s:
+            marker_ids = {
+                m.id
+                for m in (await s.execute(select(ProcessedEmailEvent))).scalars().all()
+            }
+        assert "evt-mid-2" in marker_ids, "#2 marker must be written on retry"
+        assert "evt-mid-3" in marker_ids, "#3 marker must be written on retry"
+
+    @pytest.mark.asyncio
+    async def test_malformed_handled_type_is_page_failure_cursor_unchanged(
+        self, session_factory, seeded
+    ):
+        """Review round 1 repro: a handled-type item (delivered) with a
+        malformed payload (missing ``payload.id``) is a PAGE FAILURE —
+        cursor untouched, errors=1. Pre-fix the malformed item was logged
+        as 'skipped' with errors=0 and the cursor ADVANCED, permanently
+        skipping the unprocessed event. Unhandled types (queued/sending/
+        sent) remain skippable (covered by
+        ``test_queued_sending_sent_skipped_not_processed``)."""
+        await _seed_sent_email(
+            session_factory,
+            seeded,
+            message_id="msg-malformed",
+            contact_email="malformed@acme.com",
+            enrollment_id="enr-malformed",
+            step_id="estep-malformed",
+        )
+        # A delivered event (handled type) with payload.id deleted → KeyError
+        # inside extract_event_from_api_item.
+        bad_item = _api_item(
+            event_type="email.delivered",
+            event_id="evt-malformed",
+            message_id="msg-malformed",
+            to_email="malformed@acme.com",
+        )
+        del bad_item["payload"]["id"]
+        page = _page([bad_item], next_cursor="next-malformed")
+        await save_cursor(session_factory, POLLER_FEED, "cursor-before-malformed")
+        # Key the page by the SEEDED cursor — poll_once resumes from it.
+        client = httpx.AsyncClient(
+            transport=_transport({"cursor-before-malformed": page})
+        )
+
+        summary = await poll_once(session_factory, client, BASE_URL, API_KEY)
+        await client.aclose()
+
+        assert summary.errors == 1, (
+            f"malformed handled-type must be a page error, got {summary}"
+        )
+        assert summary.skipped == 0, (
+            "malformed handled-type must NOT be counted as skipped (pre-fix bug)"
+        )
+        assert summary.processed == 0
+        assert summary.cursor_advanced is False
+        assert await load_cursor(session_factory) == "cursor-before-malformed"
 
     @pytest.mark.asyncio
     async def test_api_error_leaves_cursor_untouched(self, session_factory, seeded):

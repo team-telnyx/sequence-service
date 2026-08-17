@@ -95,6 +95,24 @@ _REASON_MAP: dict[str, SuppressionReason] = {
     EVENT_UNSUBSCRIBE: SuppressionReason.API_UNSUBSCRIBE,
 }
 
+# Telnyx Email API raw event type (``email.*``) → internal normalized type.
+# Shared by the webhook receiver (src/api/email_events.py) and the events
+# pull-poller (src/services/email_events_poller.py) so both paths map the
+# same raw ``email.bounced`` / ``email.complained`` / ``email.unsubscribed``
+# / ``email.delivered`` etc. to the same internal EVENT_* constants. Lifted
+# to the service layer (REVOPS-1525 poller pivot) so the poller does not
+# import from the api layer.
+EVENT_TYPE_MAP: dict[str, str] = {
+    "email.sent": EVENT_SENT,
+    "email.delivered": EVENT_DELIVERED,
+    "email.bounced": EVENT_BOUNCE,
+    "email.opened": EVENT_OPENED,
+    "email.clicked": EVENT_CLICKED,
+    "email.complained": EVENT_COMPLAINT,
+    "email.suppressed": EVENT_SUPPRESSED,
+    "email.unsubscribed": EVENT_UNSUBSCRIBE,
+}
+
 
 @dataclass(frozen=True)
 class EmailEvent:
@@ -492,4 +510,6 @@ def _build_idempotent_insert(
 async def _prune_dedupe(db: AsyncSession) -> None:
     """Delete dedupe markers older than DEDUPE_RETENTION_DAYS."""
     cutoff = datetime.utcnow() - timedelta(days=DEDUPE_RETENTION_DAYS)
-    await db.execute(delete(ProcessedEmailEvent).where(ProcessedEmailEvent.processed_at < cutoff))
+    await db.execute(
+        delete(ProcessedEmailEvent).where(ProcessedEmailEvent.processed_at < cutoff)
+    )

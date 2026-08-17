@@ -435,6 +435,27 @@ class ProcessedEmailEvent(Base):
     processed_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
 
+class EmailEventsPollerCursor(Base):
+    """Persisted pagination cursor for the Email API events pull-poller (REVOPS-1525).
+
+    One row per feed (PK = feed name, e.g. "email_events"). Stores the
+    last-processed ``page_cursor`` from GET /v2/email/events so the next poll
+    resumes where the last left off. On empty/missing cursor, the poller
+    starts from the first page; the ``ProcessedEmailEvent`` dedupe markers
+    make the backfill safe (re-pulled events are no-ops).
+
+    The cursor advances ONLY after every event on a page is processed
+    successfully — a failed page leaves the cursor untouched so the next
+    run re-fetches and retries (already-processed events no-op via the
+    marker). Mirrors migration 008.
+    """
+
+    __tablename__ = "email_events_poller_cursor"
+
+    # id (inherited str PK) is the feed name, e.g. "email_events".
+    last_cursor: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
+
+
 # ReplyIntent is re-exported from src.contracts (the canonical contract
 # module) for back-compat with callers that imported it from models. SV2-044
 # r3: the canonical definition lives in contracts.py so the contract-compat

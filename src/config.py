@@ -148,6 +148,8 @@ class Settings(BaseSettings):
     # -> every 10 min). The two change together; if the cron is retuned this must
     # track it or the allowance math mis-spreads the daily budget.
     reconcile_sweep_minutes: int = 10
+    # REVOPS-1668: ACTIVE enrollment with PENDING but no SCHEDULED step and no send for N days = stranded (observability only).
+    stranded_enrollment_days: int = 14
 
     # Circuit Breaker
     circuit_breaker_enabled: bool = True

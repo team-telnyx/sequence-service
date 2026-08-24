@@ -241,14 +241,31 @@ async def process_sequence_step(
         enrollment = enrollment_step.enrollment
         step = enrollment_step.step
 
-        # Check enrollment is still active
+        # Check enrollment is still active. REVOPS-1668: a terminal enrollment
+        # (COMPLETED / BOUNCED / UNSUBSCRIBED) releases its live step by marking
+        # it SKIPPED before returning — otherwise the step stays SCHEDULED, the
+        # reconciler (now ACTIVE-only) never re-enqueues it, and the row sits
+        # past-due forever. PAUSED is left untouched: circuit_resume.py:62-92
+        # re-schedules the next PENDING/SCHEDULED step on resume and depends on
+        # it still existing.
         if enrollment.status != EnrollmentStatus.ACTIVE:
             logger.info(
                 "Skipping - enrollment not active",
                 enrollment_id=enrollment.id,
                 status=enrollment.status,
             )
-            return {"skipped": True, "reason": "enrollment_not_active"}
+            if enrollment.status in (
+                EnrollmentStatus.COMPLETED,
+                EnrollmentStatus.BOUNCED,
+                EnrollmentStatus.UNSUBSCRIBED,
+            ):
+                enrollment_step.status = EnrollmentStepStatus.SKIPPED
+                await db.commit()
+            return {
+                "skipped": True,
+                "reason": "enrollment_not_active",
+                "enrollment_status": enrollment.status.value,
+            }
 
         # Suppression check — never send to suppressed contacts
         is_suppressed = await check_suppressed(db, enrollment.contact_email, tenant_id)

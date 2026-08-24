@@ -73,7 +73,9 @@ class Settings(BaseSettings):
 
     # CAN-SPAM compliance. No first-party /track/unsubscribe endpoint —
     # one-click is handled by the Telnyx Email API webhook (email.unsubscribed).
-    physical_address: str = "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
+    physical_address: str = (
+        "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
+    )
     unsubscribe_mailto: str = "mailto:unsubscribe@telnyx.com?subject=unsubscribe"
 
     # Email-to-Salesforce task logging (Kevin 2026-07-10): every outbound send is
@@ -148,11 +150,7 @@ class Settings(BaseSettings):
     # -> every 10 min). The two change together; if the cron is retuned this must
     # track it or the allowance math mis-spreads the daily budget.
     reconcile_sweep_minutes: int = 10
-    # REVOPS-1668: an ACTIVE enrollment whose last SENT step (or created_at when
-    # none) is older than this many days, with >=1 PENDING step and zero SCHEDULED
-    # steps, is "stranded" (the reconciler ignores NULL scheduled_at by design,
-    # so these never advance). Observed via the stranded_active_enrollments
-    # counter — the reconciler never mutates them.
+    # REVOPS-1668: ACTIVE enrollment with PENDING but no SCHEDULED step and no send for N days = stranded (observability only).
     stranded_enrollment_days: int = 14
 
     # Circuit Breaker

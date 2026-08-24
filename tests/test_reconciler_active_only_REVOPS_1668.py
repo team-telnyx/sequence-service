@@ -111,14 +111,17 @@ def _exit(cms):
         cm.stop()
 
 
-PAST = lambda: datetime.utcnow() - timedelta(hours=2)
+def PAST():
+    return datetime.utcnow() - timedelta(hours=2)
 
 
 # ── D1 tests 1-3: non-ACTIVE enrollments are not reconciled ──────────────
 
 
 @pytest.mark.asyncio
-async def test_paused_enrollment_step_not_reconciled(seeded, session_factory, monkeypatch):
+async def test_paused_enrollment_step_not_reconciled(
+    seeded, session_factory, monkeypatch
+):
     monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
     enr = await _make_enrollment(
         session_factory, seeded, enr_id="enr-paused", status=EnrollmentStatus.PAUSED
@@ -179,7 +182,9 @@ async def test_unsubscribed_enrollment_step_not_reconciled(
 
 
 @pytest.mark.asyncio
-async def test_active_enrollment_step_still_reconciled(seeded, session_factory, monkeypatch):
+async def test_active_enrollment_step_still_reconciled(
+    seeded, session_factory, monkeypatch
+):
     monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
     monkeypatch.setattr(rec.settings, "reconcile_pacing_window_hours", 1, raising=False)
     enr = await _make_enrollment(
@@ -266,7 +271,9 @@ async def test_dead_paused_step_does_not_consume_mailbox_allowance(
 
 
 @pytest.mark.asyncio
-async def test_stranded_active_enrollments_counter(seeded, session_factory, monkeypatch):
+async def test_stranded_active_enrollments_counter(
+    seeded, session_factory, monkeypatch
+):
     monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
     monkeypatch.setattr(rec.settings, "stranded_enrollment_days", 14, raising=False)
 
@@ -275,7 +282,11 @@ async def test_stranded_active_enrollments_counter(seeded, session_factory, monk
 
     # (a) stranded: ACTIVE, PENDING step, no SCHEDULED, last SENT older than 14d.
     enr_a = await _make_enrollment(
-        session_factory, seeded, enr_id="enr-a", status=EnrollmentStatus.ACTIVE, created_at=old
+        session_factory,
+        seeded,
+        enr_id="enr-a",
+        status=EnrollmentStatus.ACTIVE,
+        created_at=old,
     )
     await _make_step(
         session_factory,
@@ -288,7 +299,11 @@ async def test_stranded_active_enrollments_counter(seeded, session_factory, monk
 
     # (b) NOT stranded: last SENT inside the threshold (2 days ago).
     enr_b = await _make_enrollment(
-        session_factory, seeded, enr_id="enr-b", status=EnrollmentStatus.ACTIVE, created_at=old
+        session_factory,
+        seeded,
+        enr_id="enr-b",
+        status=EnrollmentStatus.ACTIVE,
+        created_at=old,
     )
     await _make_step(
         session_factory,
@@ -301,7 +316,11 @@ async def test_stranded_active_enrollments_counter(seeded, session_factory, monk
 
     # (c) NOT stranded: has a SCHEDULED step (so the reconciler is still pushing it).
     enr_c = await _make_enrollment(
-        session_factory, seeded, enr_id="enr-c", status=EnrollmentStatus.ACTIVE, created_at=old
+        session_factory,
+        seeded,
+        enr_id="enr-c",
+        status=EnrollmentStatus.ACTIVE,
+        created_at=old,
     )
     await _make_step(
         session_factory,
@@ -350,9 +369,7 @@ async def test_process_step_inactive_enrollment(
     seeded, session_factory, status, expected_step_status
 ):
     enr_id = f"enr-{status.value}"
-    enr = await _make_enrollment(
-        session_factory, seeded, enr_id=enr_id, status=status
-    )
+    enr = await _make_enrollment(session_factory, seeded, enr_id=enr_id, status=status)
     est = await _make_step(
         session_factory,
         enrollment_id=enr,
@@ -500,49 +517,137 @@ async def _enr_status(session_factory, enr_id):
 
 
 @pytest.mark.asyncio
-async def test_remediation_script_dry_run_mutates_nothing(seeded, session_factory):
+async def test_remediation_script_dry_run_mutates_nothing(
+    seeded, session_factory, tmp_path
+):
     from scripts.remediate_reconciler_starvation_REVOPS_1668 import run
+
     await _seed_script_scenario(session_factory, seeded)
-    out = await run(apply=False, stranded_days=14, session_factory=session_factory)
+    audit = tmp_path / "audit_dry.json"
+    out = await run(
+        apply=False,
+        stranded_days=14,
+        session_factory=session_factory,
+        audit_out=str(audit),
+    )
     assert out["phase1_enrollments"] == 1
     assert out["phase2_enrollments"] == 1
     assert out["phase1_steps"] == 0
     assert out["phase2_steps"] == 0
-    assert await _step_status(session_factory, "est-term") == EnrollmentStepStatus.SCHEDULED
-    assert await _step_status(session_factory, "est-stranded") == EnrollmentStepStatus.PENDING
-    assert await _step_status(session_factory, "est-paused") == EnrollmentStepStatus.PENDING
+    assert (
+        await _step_status(session_factory, "est-term")
+        == EnrollmentStepStatus.SCHEDULED
+    )
+    assert (
+        await _step_status(session_factory, "est-stranded")
+        == EnrollmentStepStatus.PENDING
+    )
+    assert (
+        await _step_status(session_factory, "est-paused")
+        == EnrollmentStepStatus.PENDING
+    )
     assert await _enr_status(session_factory, "enr-stranded") == EnrollmentStatus.ACTIVE
-    assert await _enr_status(session_factory, "enr-term") == EnrollmentStatus.UNSUBSCRIBED
+    assert (
+        await _enr_status(session_factory, "enr-term") == EnrollmentStatus.UNSUBSCRIBED
+    )
     assert await _enr_status(session_factory, "enr-paused") == EnrollmentStatus.PAUSED
 
 
 @pytest.mark.asyncio
-async def test_remediation_script_apply_both_phases(seeded, session_factory):
+async def test_remediation_script_apply_both_phases(seeded, session_factory, tmp_path):
     from scripts.remediate_reconciler_starvation_REVOPS_1668 import run
+
     await _seed_script_scenario(session_factory, seeded)
-    out = await run(apply=True, stranded_days=14, session_factory=session_factory)
+    audit = tmp_path / "audit_apply.json"
+    out = await run(
+        apply=True,
+        stranded_days=14,
+        session_factory=session_factory,
+        audit_out=str(audit),
+    )
     assert out["phase1_enrollments"] == 1
     assert out["phase1_steps"] == 1
     assert out["phase2_enrollments"] == 1
     assert out["phase2_steps"] == 1
-    assert await _step_status(session_factory, "est-term") == EnrollmentStepStatus.SKIPPED
-    assert await _step_status(session_factory, "est-stranded") == EnrollmentStepStatus.SKIPPED
-    assert await _enr_status(session_factory, "enr-stranded") == EnrollmentStatus.COMPLETED
+    assert (
+        await _step_status(session_factory, "est-term") == EnrollmentStepStatus.SKIPPED
+    )
+    assert (
+        await _step_status(session_factory, "est-stranded")
+        == EnrollmentStepStatus.SKIPPED
+    )
+    assert (
+        await _enr_status(session_factory, "enr-stranded") == EnrollmentStatus.COMPLETED
+    )
+    # REVOPS-1668 D3: pause_reason must stay NULL (CHECK-constrained to NULL or
+    # the existing reason set — no new marker value, no migration).
+    async with session_factory() as s:
+        en = await s.get(SequenceEnrollment, "enr-stranded")
+        assert en.pause_reason is None
     # PAUSED enrollment and its step are untouched.
-    assert await _step_status(session_factory, "est-paused") == EnrollmentStepStatus.PENDING
+    assert (
+        await _step_status(session_factory, "est-paused")
+        == EnrollmentStepStatus.PENDING
+    )
     assert await _enr_status(session_factory, "enr-paused") == EnrollmentStatus.PAUSED
     # Recent ACTIVE enrollment (inside threshold) is untouched.
     assert await _enr_status(session_factory, "enr-recent") == EnrollmentStatus.ACTIVE
-    assert await _step_status(session_factory, "est-recent") == EnrollmentStepStatus.PENDING
+    assert (
+        await _step_status(session_factory, "est-recent")
+        == EnrollmentStepStatus.PENDING
+    )
 
 
 @pytest.mark.asyncio
-async def test_remediation_script_idempotent(seeded, session_factory):
+async def test_remediation_script_idempotent(seeded, session_factory, tmp_path):
     from scripts.remediate_reconciler_starvation_REVOPS_1668 import run
+
+    audit = tmp_path / "audit_idem.json"
     await _seed_script_scenario(session_factory, seeded)
-    await run(apply=True, stranded_days=14, session_factory=session_factory)
-    out = await run(apply=True, stranded_days=14, session_factory=session_factory)
+    await run(
+        apply=True,
+        stranded_days=14,
+        session_factory=session_factory,
+        audit_out=str(audit),
+    )
+    out = await run(
+        apply=True,
+        stranded_days=14,
+        session_factory=session_factory,
+        audit_out=str(audit),
+    )
     assert out["phase1_enrollments"] == 0
     assert out["phase1_steps"] == 0
     assert out["phase2_enrollments"] == 0
     assert out["phase2_steps"] == 0
+
+
+@pytest.mark.asyncio
+async def test_remediation_script_audit_json_and_table_stdout(
+    seeded, session_factory, tmp_path, capsys
+):
+    """D3: dry-run writes audit JSON with expected enrollment ids and the
+    plain-text table lines appear in captured stdout."""
+    import json
+    from scripts.remediate_reconciler_starvation_REVOPS_1668 import run
+
+    await _seed_script_scenario(session_factory, seeded)
+    audit = tmp_path / "audit_test.json"
+    await run(
+        apply=False,
+        stranded_days=14,
+        session_factory=session_factory,
+        audit_out=str(audit),
+    )
+    captured = capsys.readouterr()
+    data = json.loads(audit.read_text())
+    assert set(data.keys()) == {"phase1", "phase1_counts", "phase2"}
+    p1_ids = {r["enrollment_id"] for r in data["phase1"]}
+    p2_ids = {r["enrollment_id"] for r in data["phase2"]}
+    assert p1_ids == {"enr-term"}
+    assert p2_ids == {"enr-stranded"}
+    assert "enr-term" in captured.out
+    assert "enr-stranded" in captured.out
+    assert "Phase 1" in captured.out
+    assert "Phase 2" in captured.out
+    assert "per-status step counts" in captured.out

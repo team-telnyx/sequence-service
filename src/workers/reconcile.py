@@ -52,6 +52,7 @@ from sqlalchemy import func, select
 from src.config import get_settings
 from src.models.base import async_session
 from src.models.models import (
+    EnrollmentStatus,
     EnrollmentStepStatus,
     Mailbox,
     Sequence,
@@ -70,8 +71,16 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
     Returns {"reconciled": n, "advanced": a, "scanned": m,
     "past_due_backlog_depth": d, "skipped_at_capacity": k,
     "skipped_reserve_floor": j, "skipped_mailbox_missing": p,
-    "skipped_no_mailbox": q, "per_mailbox": {mailbox_id: {reconciled, advanced,
-    pending, spare, ...}}}.
+    "skipped_no_mailbox": q, "skipped_inactive_enrollment": r,
+    "stranded_active_enrollments": s,
+    "per_mailbox": {mailbox_id: {reconciled, advanced, pending, spare, ...}}}.
+
+    REVOPS-1668: only ACTIVE enrollments' steps are selected/enqueued.
+    `skipped_inactive_enrollment` counts SCHEDULED past-due steps whose
+    enrollment is not ACTIVE (observability — no allowance spent on them).
+    `stranded_active_enrollments` counts ACTIVE enrollments with >=1 PENDING
+    step, zero SCHEDULED steps, and last SENT (or created_at) older than
+    settings.stranded_enrollment_days — observed, never mutated.
 
     `reconciled` counts ONLY newly-enqueued jobs (a deduped enqueue returns
     None and is not counted). `advanced` counts every step whose
@@ -98,6 +107,8 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
     skipped_reserve_floor = 0
     skipped_mailbox_missing = 0
     skipped_no_mailbox = 0
+    skipped_inactive_enrollment = 0
+    stranded_active_enrollments = 0
     per_mailbox_out: dict = {}
 
     async with async_session() as db:
@@ -117,6 +128,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
                 )
                 .where(
                     SequenceEnrollmentStep.status == EnrollmentStepStatus.SCHEDULED,
+                    SequenceEnrollment.status == EnrollmentStatus.ACTIVE,
                     # NULL < cutoff is NULL/false — a NULL scheduled_at is NOT
                     # selected. A future `OR scheduled_at IS NULL` here would
                     # re-fire follow-ups whose arq job is legitimately pending.
@@ -127,6 +139,66 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
         ).all()
         pending_by_mailbox: dict = {row.mid: row.pending for row in pending_rows}
         backlog_depth = sum(pending_by_mailbox.values())
+
+        # REVOPS-1668: count SCHEDULED past-due steps on NON-ACTIVE enrollments
+        # for observability (these are the dead rows the reconciler now skips).
+        # One cheap COUNT — no allowance is spent on them.
+        skipped_inactive_enrollment = (
+            await db.execute(
+                select(func.count(SequenceEnrollmentStep.id))
+                .join(
+                    SequenceEnrollment,
+                    SequenceEnrollment.id == SequenceEnrollmentStep.enrollment_id,
+                )
+                .where(
+                    SequenceEnrollmentStep.status == EnrollmentStepStatus.SCHEDULED,
+                    SequenceEnrollment.status != EnrollmentStatus.ACTIVE,
+                    SequenceEnrollmentStep.scheduled_at < cutoff,
+                )
+            )
+        ).scalar() or 0
+
+        # REVOPS-1668: stranded ACTIVE enrollments — >=1 PENDING step, zero
+        # SCHEDULED steps, and most recent SENT (or enrollment.created_at when
+        # no step was ever sent) older than settings.stranded_enrollment_days.
+        # Observed only; the reconciler never enqueues or mutates these.
+        stranded_days = getattr(settings, "stranded_enrollment_days", 14)
+        stranded_cutoff = now - timedelta(days=stranded_days)
+        last_sent_subq = (
+            select(
+                SequenceEnrollmentStep.enrollment_id.label("enr_id"),
+                func.max(SequenceEnrollmentStep.sent_at).label("last_sent"),
+            ).group_by(SequenceEnrollmentStep.enrollment_id)
+        ).subquery()
+        has_pending_subq = (
+            select(SequenceEnrollmentStep.enrollment_id).where(
+                SequenceEnrollmentStep.status == EnrollmentStepStatus.PENDING
+            )
+        ).subquery()
+        has_scheduled_subq = (
+            select(SequenceEnrollmentStep.enrollment_id).where(
+                SequenceEnrollmentStep.status == EnrollmentStepStatus.SCHEDULED
+            )
+        ).subquery()
+        stranded_active_enrollments = (
+            await db.execute(
+                select(func.count(SequenceEnrollment.id))
+                .outerjoin(
+                    last_sent_subq, last_sent_subq.c.enr_id == SequenceEnrollment.id
+                )
+                .where(
+                    SequenceEnrollment.status == EnrollmentStatus.ACTIVE,
+                    SequenceEnrollment.id.in_(select(has_pending_subq.c.enrollment_id)),
+                    ~SequenceEnrollment.id.in_(
+                        select(has_scheduled_subq.c.enrollment_id)
+                    ),
+                    func.coalesce(
+                        last_sent_subq.c.last_sent, SequenceEnrollment.created_at
+                    )
+                    < stranded_cutoff,
+                )
+            )
+        ).scalar() or 0
 
         # Selection: ROW_NUMBER() OVER (PARTITION BY enrollment.mailbox_id ORDER BY
         # scheduled_at ASC) bounds the fetch to per_mailbox_per_run × n_mailboxes
@@ -158,6 +230,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
             .join(Sequence, Sequence.id == SequenceEnrollment.sequence_id)
             .where(
                 SequenceEnrollmentStep.status == EnrollmentStepStatus.SCHEDULED,
+                SequenceEnrollment.status == EnrollmentStatus.ACTIVE,
                 # NULL < cutoff is NULL/false — see comment on pending query.
                 SequenceEnrollmentStep.scheduled_at < cutoff,
             )
@@ -351,6 +424,8 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
         skipped_reserve_floor=skipped_reserve_floor,
         skipped_mailbox_missing=skipped_mailbox_missing,
         skipped_no_mailbox=skipped_no_mailbox,
+        skipped_inactive_enrollment=skipped_inactive_enrollment,
+        stranded_active_enrollments=stranded_active_enrollments,
         per_mailbox=per_mailbox_out,
     )
     return {
@@ -362,5 +437,7 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
         "skipped_reserve_floor": skipped_reserve_floor,
         "skipped_mailbox_missing": skipped_mailbox_missing,
         "skipped_no_mailbox": skipped_no_mailbox,
+        "skipped_inactive_enrollment": skipped_inactive_enrollment,
+        "stranded_active_enrollments": stranded_active_enrollments,
         "per_mailbox": per_mailbox_out,
     }

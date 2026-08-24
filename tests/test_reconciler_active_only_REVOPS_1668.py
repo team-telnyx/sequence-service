@@ -293,8 +293,16 @@ async def test_stranded_active_enrollments_counter(
         enrollment_id=enr_a,
         status=EnrollmentStepStatus.PENDING,
         scheduled_at=None,
+        sent_at=None,
+        est_id="est-a-pending",
+    )
+    await _make_step(
+        session_factory,
+        enrollment_id=enr_a,
+        status=EnrollmentStepStatus.SENT,
+        scheduled_at=None,
         sent_at=old,
-        est_id="est-a",
+        est_id="est-a-sent",
     )
 
     # (b) NOT stranded: last SENT inside the threshold (2 days ago).
@@ -310,8 +318,16 @@ async def test_stranded_active_enrollments_counter(
         enrollment_id=enr_b,
         status=EnrollmentStepStatus.PENDING,
         scheduled_at=None,
+        sent_at=None,
+        est_id="est-b-pending",
+    )
+    await _make_step(
+        session_factory,
+        enrollment_id=enr_b,
+        status=EnrollmentStepStatus.SENT,
+        scheduled_at=None,
         sent_at=recent,
-        est_id="est-b",
+        est_id="est-b-sent",
     )
 
     # (c) NOT stranded: has a SCHEDULED step (so the reconciler is still pushing it).
@@ -327,7 +343,7 @@ async def test_stranded_active_enrollments_counter(
         enrollment_id=enr_c,
         status=EnrollmentStepStatus.PENDING,
         scheduled_at=None,
-        sent_at=old,
+        sent_at=None,
         est_id="est-c1",
     )
     await _make_step(
@@ -651,3 +667,140 @@ async def test_remediation_script_audit_json_and_table_stdout(
     assert "Phase 1" in captured.out
     assert "Phase 2" in captured.out
     assert "per-status step counts" in captured.out
+
+
+# ── D1/D3 adversarial: last_sent must aggregate SENT steps only ──────────
+#
+# Reviewer FAIL D1/D3: last_sent_subq aggregated max(sent_at) across every
+# step status. An old actual SENT step plus a recent PENDING row carrying a
+# sent_at value incorrectly suppressed the stranded counter (reconcile.py)
+# and phase-2 remediation (script). The contract: "most recent SENT step
+# sent_at" means filter on EnrollmentStepStatus.SENT — a PENDING row's
+# sent_at column is not a SENT event.
+
+
+@pytest.mark.asyncio
+async def test_stranded_counter_ignores_pending_sent_at(
+    seeded, session_factory, monkeypatch
+):
+    """An old SENT step + a recent PENDING row with sent_at set must still
+    count the enrollment as stranded — the recent PENDING sent_at must NOT
+    mask the old real SENT."""
+    monkeypatch.setattr(rec.settings, "reconcile_grace_seconds", 600, raising=False)
+    monkeypatch.setattr(rec.settings, "stranded_enrollment_days", 14, raising=False)
+
+    old = datetime.utcnow() - timedelta(days=30)
+    recent = datetime.utcnow() - timedelta(days=2)
+
+    # ACTIVE enrollment with an old real SENT step and a recent PENDING step
+    # that carries a sent_at value (stale column on a non-SENT row).
+    enr = await _make_enrollment(
+        session_factory,
+        seeded,
+        enr_id="enr-sent-contract",
+        status=EnrollmentStatus.ACTIVE,
+        created_at=old,
+    )
+    # Old real SENT step — this is the actual last-sent event.
+    await _make_step(
+        session_factory,
+        enrollment_id=enr,
+        status=EnrollmentStepStatus.SENT,
+        scheduled_at=None,
+        sent_at=old,
+        est_id="est-sent-old",
+    )
+    # Recent PENDING step with a stale sent_at — must NOT be treated as a SENT.
+    await _make_step(
+        session_factory,
+        enrollment_id=enr,
+        status=EnrollmentStepStatus.PENDING,
+        scheduled_at=None,
+        sent_at=recent,
+        est_id="est-pending-recent",
+    )
+
+    q = AsyncMock(return_value="job-1")
+    cms = _patch(session_factory, q)
+    _enter(cms)
+    try:
+        out = await rec.reconcile_scheduled_steps({})
+    finally:
+        _exit(cms)
+    # No SCHEDULED steps → reconciled == 0. The enrollment IS stranded: the
+    # only real SENT is 30d old, exceeding the 14d threshold. The recent
+    # PENDING row's sent_at must not suppress the counter.
+    assert out["reconciled"] == 0
+    assert out["stranded_active_enrollments"] == 1, (
+        "stranded counter must aggregate SENT steps only; a recent PENDING "
+        "row carrying sent_at must not mask an old real SENT step"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_phase2_ignores_pending_sent_at(
+    seeded, session_factory, tmp_path
+):
+    """Phase-2 remediation must select the same stranded enrollment: old SENT
+    + recent PENDING-with-sent_at → stranded (selected for phase 2)."""
+    from scripts.remediate_reconciler_starvation_REVOPS_1668 import run
+
+    old = datetime.utcnow() - timedelta(days=30)
+    recent = datetime.utcnow() - timedelta(days=2)
+    mb = seeded["active_mailbox_id"]
+
+    async with session_factory() as s:
+        s.add(
+            SequenceEnrollment(
+                id="enr-sent-contract",
+                sequence_id=seeded["sequence_id"],
+                mailbox_id=mb,
+                contact_email="sc@acme.com",
+                contact_name="SC",
+                timezone="America/New_York",
+                status=EnrollmentStatus.ACTIVE,
+                current_step=0,
+                created_at=old,
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="est-sent-old",
+                enrollment_id="enr-sent-contract",
+                step_id="step-1",
+                mailbox_id=mb,
+                status=EnrollmentStepStatus.SENT,
+                scheduled_at=None,
+                sent_at=old,
+                custom_subject="x",
+                custom_body="<p>y</p>",
+            )
+        )
+        s.add(
+            SequenceEnrollmentStep(
+                id="est-pending-recent",
+                enrollment_id="enr-sent-contract",
+                step_id="step-2",
+                mailbox_id=mb,
+                status=EnrollmentStepStatus.PENDING,
+                scheduled_at=None,
+                sent_at=recent,
+                custom_subject="x",
+                custom_body="<p>y</p>",
+            )
+        )
+        await s.commit()
+
+    audit = tmp_path / "audit_sent_contract.json"
+    out = await run(
+        apply=False,
+        stranded_days=14,
+        session_factory=session_factory,
+        audit_out=str(audit),
+    )
+    # The enrollment must be selected by phase 2 despite the recent PENDING
+    # row's sent_at — the only real SENT is 30d old.
+    assert out["phase2_enrollments"] == 1, (
+        "phase-2 remediation must aggregate SENT steps only; a recent "
+        "PENDING row carrying sent_at must not mask an old real SENT step"
+    )

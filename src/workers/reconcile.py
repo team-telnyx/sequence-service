@@ -168,7 +168,9 @@ async def reconcile_scheduled_steps(ctx: dict) -> dict:
             select(
                 SequenceEnrollmentStep.enrollment_id.label("enr_id"),
                 func.max(SequenceEnrollmentStep.sent_at).label("last_sent"),
-            ).group_by(SequenceEnrollmentStep.enrollment_id)
+            )
+            .where(SequenceEnrollmentStep.status == EnrollmentStepStatus.SENT)
+            .group_by(SequenceEnrollmentStep.enrollment_id)
         ).subquery()
         has_pending_subq = (
             select(SequenceEnrollmentStep.enrollment_id).where(

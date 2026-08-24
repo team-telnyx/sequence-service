@@ -73,9 +73,7 @@ class Settings(BaseSettings):
 
     # CAN-SPAM compliance. No first-party /track/unsubscribe endpoint —
     # one-click is handled by the Telnyx Email API webhook (email.unsubscribed).
-    physical_address: str = (
-        "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
-    )
+    physical_address: str = "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
     unsubscribe_mailto: str = "mailto:unsubscribe@telnyx.com?subject=unsubscribe"
 
     # Email-to-Salesforce task logging (Kevin 2026-07-10): every outbound send is

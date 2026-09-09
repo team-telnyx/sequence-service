@@ -8,17 +8,31 @@ from functools import lru_cache
 # HARDCODED MAILBOX ALLOCATION — DO NOT MODIFY WITHOUT APPROVAL
 # =============================================================
 # Scout-only deployment (REVOPS-972 / M4 / QC-4). The service runs a single
-# tenant (tenant-scout) and sends ONLY through the 8 Scout sender inboxes
-# quinn.c–quinn.j. The Quinn pool, the multi-tenant TENANT_MAILBOX_MAP, and the
-# unknown-tenant ALL_ALLOWED_MAILBOXES fallback are removed: a single
-# SCOUT_MAILBOXES membership check (validate_mailbox_for_tenant, below) is the
-# in-code safety net even if the DB is misconfigured, with NO escape hatch.
+# tenant (tenant-scout) and sends ONLY through the 8 physical Scout sender
+# inboxes quinn.c–quinn.j. The Quinn pool, the multi-tenant
+# TENANT_MAILBOX_MAP, and the unknown-tenant ALL_ALLOWED_MAILBOXES fallback
+# are removed: a single SCOUT_MAILBOXES membership check
+# (validate_mailbox_for_tenant, below) is the in-code safety net even if the
+# DB is misconfigured, with NO escape hatch.
+#
+# The pool spans BOTH sending domains: the gmail lane (.com, REVOPS-972)
+# and the Telnyx Email API warm-up lane (.co, REVOPS-1525). quinn.c–j@telnyx.co
+# are the SAME 8 physical Scout inboxes on the warm-up domain; the Email API
+# transport selects them when a mailbox row sets transport='email_api'. The
+# .com entries remain the gmail lane. Rotation (mailbox_rotation.py) selects
+# across the full 16-row pool — both lanes feed the same daily-send budget
+# per physical inbox.
+#
+# Approval reference: Kevin Ward, 2026-09-08 — greenlit the .co warm-up flip
+# (REVOPS-1422 / REVOPS-1525) and the corresponding allowlist expansion.
+#
 # (quinn.c–j are physical inboxes owned by Scout; the "quinn." local-part is
 # legacy naming, not the retired tenant-quinn pool.)
 # =============================================================
 
 SCOUT_MAILBOXES = frozenset(
     {
+        # gmail lane (REVOPS-972 / M4)
         "quinn.c@telnyx.com",
         "quinn.d@telnyx.com",
         "quinn.e@telnyx.com",
@@ -27,6 +41,15 @@ SCOUT_MAILBOXES = frozenset(
         "quinn.h@telnyx.com",
         "quinn.i@telnyx.com",
         "quinn.j@telnyx.com",
+        # Email API warm-up lane (REVOPS-1525; approval Kevin 2026-09-08)
+        "quinn.c@telnyx.co",
+        "quinn.d@telnyx.co",
+        "quinn.e@telnyx.co",
+        "quinn.f@telnyx.co",
+        "quinn.g@telnyx.co",
+        "quinn.h@telnyx.co",
+        "quinn.i@telnyx.co",
+        "quinn.j@telnyx.co",
     }
 )
 
@@ -73,7 +96,9 @@ class Settings(BaseSettings):
 
     # CAN-SPAM compliance. No first-party /track/unsubscribe endpoint —
     # one-click is handled by the Telnyx Email API webhook (email.unsubscribed).
-    physical_address: str = "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
+    physical_address: str = (
+        "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
+    )
     unsubscribe_mailto: str = "mailto:unsubscribe@telnyx.com?subject=unsubscribe"
 
     # Email-to-Salesforce task logging (Kevin 2026-07-10): every outbound send is

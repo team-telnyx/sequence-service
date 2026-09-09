@@ -20,8 +20,12 @@ from functools import lru_cache
 # are the SAME 8 physical Scout inboxes on the warm-up domain; the Email API
 # transport selects them when a mailbox row sets transport='email_api'. The
 # .com entries remain the gmail lane. Rotation (mailbox_rotation.py) selects
-# across the full 16-row pool — both lanes feed the same daily-send budget
-# per physical inbox.
+# across the full 16-row pool. daily_send_limit is per mailbox ROW (per lane):
+# each .com and .co row carries its own daily_send_limit / sent_today columns
+# (models.py: Mailbox.daily_send_limit), NOT a shared per-physical-inbox budget.
+# The .co lane's send volume is governed by the warm-up ramp applier (which
+# sets the .co rows' daily_send_limit), and fleet-level pacing across the 16-row
+# pool is scout-side (admission / stagger in Scout), not this service.
 #
 # Approval reference: Kevin Ward, 2026-09-08 — greenlit the .co warm-up flip
 # (REVOPS-1422 / REVOPS-1525) and the corresponding allowlist expansion.
@@ -96,9 +100,7 @@ class Settings(BaseSettings):
 
     # CAN-SPAM compliance. No first-party /track/unsubscribe endpoint —
     # one-click is handled by the Telnyx Email API webhook (email.unsubscribed).
-    physical_address: str = (
-        "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
-    )
+    physical_address: str = "Telnyx LLC, 600 Congress Avenue, 14th Floor, Austin, TX 78701, USA"
     unsubscribe_mailto: str = "mailto:unsubscribe@telnyx.com?subject=unsubscribe"
 
     # Email-to-Salesforce task logging (Kevin 2026-07-10): every outbound send is
@@ -227,20 +229,26 @@ def get_settings() -> Settings:
 
 def validate_mailbox_for_tenant(tenant_id: str, email: str) -> bool:
     """
-    Validate that a mailbox email is allowed to send.
+    Validate that a mailbox email is allowed to send for this tenant.
 
-    Scout-only (REVOPS-972 / M4): the single allowed pool is SCOUT_MAILBOXES.
-    Returns True if allowed, raises ValueError otherwise. This is the hardcoded
-    safety check — even if the DB is misconfigured, it blocks any non-Scout
-    mailbox, and there is NO unknown-tenant fallback that could reach a mailbox.
-
-    `tenant_id` is retained in the signature for call-site compatibility
-    (enrollments.py, sequence_step.py) but the check is the same single Scout
-    allowlist regardless of tenant.
+    Scout-only (REVOPS-972 / M4): the single allowed tenant is ``tenant-scout``
+    and the single allowed pool is SCOUT_MAILBOXES. Returns True iff the tenant
+    is ``tenant-scout`` AND the mailbox is in SCOUT_MAILBOXES; raises ValueError
+    otherwise. This is the hardcoded safety check — even if the DB is
+    misconfigured, it blocks any non-Scout mailbox, and there is NO
+    unknown-tenant fallback that could reach a mailbox. A tenant string other
+    than ``tenant-scout`` is rejected regardless of the mailbox, restoring the
+    documented no-escape-hatch (the r1 loosening that accepted any tenant
+    string as long as the mailbox was in SCOUT_MAILBOXES was a regression).
     """
+    if tenant_id != "tenant-scout":
+        raise ValueError(
+            f"Tenant {tenant_id} is not allowed (single-tenant service: "
+            f"tenant-scout only). Mailbox {email} rejected."
+        )
     if email not in SCOUT_MAILBOXES:
         raise ValueError(
-            f"Mailbox {email} is not an allowed Scout sender "
-            f"(tenant {tenant_id}). Allowed: {sorted(SCOUT_MAILBOXES)}"
+            f"Mailbox {email} is not an allowed Scout sender. "
+            f"Allowed: {sorted(SCOUT_MAILBOXES)}"
         )
     return True
